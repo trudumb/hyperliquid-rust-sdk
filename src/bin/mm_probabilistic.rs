@@ -56,10 +56,11 @@ impl PoissonFlowAnalyzer {
     }
 
     fn add_trade(&mut self, event: TradeEvent) {
-        self.trade_events.push_back(event);
+        let timestamp = event.timestamp;  // Get timestamp first
+        self.trade_events.push_back(event);  // Then move event
 
         // Clean old events
-        let cutoff = event.timestamp.saturating_sub(self.window_ms);
+        let cutoff = timestamp.saturating_sub(self.window_ms);
         while let Some(e) = self.trade_events.front() {
             if e.timestamp < cutoff {
                 self.trade_events.pop_front();
@@ -70,7 +71,7 @@ impl PoissonFlowAnalyzer {
 
         // Update baseline lambda (exponential moving average)
         if self.trade_events.len() >= 2 {
-            let time_span = (event.timestamp - self.trade_events.front().unwrap().timestamp) as f64 / 1000.0;
+            let time_span = (timestamp - self.trade_events.front().unwrap().timestamp) as f64 / 1000.0;
             if time_span > 0.0 {
                 let current_rate = self.trade_events.len() as f64 / time_span;
                 if self.baseline_lambda < EPSILON {
