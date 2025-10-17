@@ -228,15 +228,15 @@ impl TrendDetector {
         let trend_strength = self.get_trend_strength().abs();
         let z_score = self.get_momentum_z_score().abs();
 
-        if volatility > 0.03 {
+        if volatility > 0.04 {  // Raised threshold
             return MarketRegime::Volatile;
         }
 
-        if trend_strength > 0.4 || z_score > 2.0 {
+        if trend_strength > 0.5 || z_score > 2.5 {  // Raised thresholds
             return MarketRegime::Trending;
         }
 
-        if volatility < 0.01 && trend_strength < 0.2 {
+        if volatility < 0.015 && trend_strength < 0.25 {
             return MarketRegime::Calm;
         }
 
@@ -398,38 +398,25 @@ impl MarketMakerState {
             let position_size = self.position.abs();
             let position_notional = position_size * self.average_entry;
             
-            // Initial margin for the position
             self.margin_used = position_notional / self.leverage;
             
-            // Calculate liquidation price based on total account value
-            // Account capital available (excluding unrealized PnL)
             let account_capital = self.initial_capital + self.realized_pnl - self.total_fees_paid;
             
             if self.position > 0.0 {
-                // LONG position liquidation formula:
-                // At liq: account_capital + (liq_price - entry) * size = liq_price * size / (2 * leverage)
-                // Solving: liq_price = (account_capital - entry * size) / (size * ((1/(2*leverage)) - 1))
-                
                 let numerator = account_capital - self.average_entry * position_size;
                 let denominator = position_size * ((1.0 / (2.0 * self.leverage)) - 1.0);
                 
                 if denominator.abs() < 1e-10 {
-                    // Avoid division by zero - very high leverage
                     self.liquidation_price = 0.0;
                 } else {
                     self.liquidation_price = numerator / denominator;
                 }
             } else {
-                // SHORT position liquidation formula:
-                // At liq: account_capital + (entry - liq_price) * size = liq_price * size / (2 * leverage)
-                // Solving: liq_price = (account_capital + entry * size) / (size * (1 + 1/(2*leverage)))
-                
                 let numerator = account_capital + self.average_entry * position_size;
                 let denominator = position_size * (1.0 + 1.0 / (2.0 * self.leverage));
                 self.liquidation_price = numerator / denominator;
             }
             
-            // Ensure liquidation price is positive
             self.liquidation_price = self.liquidation_price.max(0.0);
         } else {
             self.margin_used = 0.0;
@@ -438,19 +425,13 @@ impl MarketMakerState {
     }
 
     fn update_capital(&mut self) {
-        // Current capital is initial capital + realized PnL - fees
-        // Unrealized PnL is NOT added to capital (it's just mark-to-market)
         self.current_capital = self.initial_capital + self.realized_pnl - self.total_fees_paid;
     }
 
     fn get_available_margin(&self) -> f64 {
-        // Available margin for new positions
-        // Must account for both margin used AND maintain 10% buffer for transfers
         let equity = self.current_capital + self.unrealized_pnl;
         let used_margin = self.margin_used;
         
-        // For new positions, we need to ensure we keep enough for existing positions
-        // and maintain the 10% transfer requirement
         let position_notional = if self.position != 0.0 {
             self.position.abs() * self.mid_price
         } else {
@@ -468,13 +449,9 @@ impl MarketMakerState {
         }
         
         let available_margin = self.get_available_margin();
-        
-        // With leverage L, margin_required = notional / L
-        // So: max_notional = available_margin * L
         let max_notional_from_margin = available_margin * self.leverage;
         let max_size_from_margin = max_notional_from_margin / price;
         
-        // Return the smaller of margin-based limit and configured limit
         max_size_from_margin.min(max_position_limit)
     }
 
@@ -486,10 +463,8 @@ impl MarketMakerState {
         let buffer_multiplier = 1.0 + (buffer_pct / 100.0);
 
         if self.position > 0.0 {
-            // Long position: liquidation price is BELOW entry, check if current price is approaching it
             self.mid_price < self.liquidation_price * buffer_multiplier
         } else {
-            // Short position: liquidation price is ABOVE entry, check if current price is approaching it  
             self.mid_price > self.liquidation_price / buffer_multiplier
         }
     }
@@ -644,10 +619,8 @@ impl MarketMakerState {
         let time_elapsed = now - self.session_start_time;
         let in_grace_period = time_elapsed < limits.startup_grace_period_ms;
 
-        // Calculate account equity (for cross margin, this would be account value)
         let equity = self.current_capital + self.unrealized_pnl;
         
-        // Maintenance margin check - most critical
         if self.position != 0.0 {
             let position_notional = self.position.abs() * self.mid_price;
             let maintenance_margin_ratio = 1.0 / (2.0 * self.leverage);
@@ -662,7 +635,6 @@ impl MarketMakerState {
             }
         }
 
-        // Liquidation proximity check
         if self.is_near_liquidation(limits.liquidation_buffer_pct) {
             violations.push(format!(
                 "Near liquidation! Current: ${:.4}, Liquidation: ${:.4}",
@@ -671,7 +643,6 @@ impl MarketMakerState {
             is_safe = false;
         }
 
-        // Margin usage check - based on equity not just initial capital
         if equity > 0.0 {
             let margin_usage_pct = (self.margin_used / equity) * 100.0;
             if margin_usage_pct > limits.max_margin_usage_pct {
@@ -683,7 +654,6 @@ impl MarketMakerState {
             }
         }
 
-        // Position limit
         if self.position.abs() > limits.max_position_size {
             violations.push(format!(
                 "Position limit breached: {:.2} > {:.2}",
@@ -693,7 +663,6 @@ impl MarketMakerState {
             is_safe = false;
         }
 
-        // Loss limit
         let total_pnl = self.realized_pnl + self.unrealized_pnl - self.total_fees_paid;
         if total_pnl < -limits.max_loss_per_day {
             violations.push(format!(
@@ -703,7 +672,6 @@ impl MarketMakerState {
             is_safe = false;
         }
 
-        // Drawdown check (outside grace period)
         if !in_grace_period {
             let drawdown_value = self.get_current_drawdown_pct();
             
@@ -724,8 +692,6 @@ impl MarketMakerState {
                     is_safe = false;
                 }
             }
-        } else if !violations.is_empty() {
-
         }
 
         (is_safe, violations)
@@ -765,7 +731,6 @@ impl MarketMakerState {
             0.0
         };
 
-        // Calculate equity and margin usage based on equity
         let equity = self.current_capital + self.unrealized_pnl;
         let margin_usage_pct = if equity > 0.0 {
             (self.margin_used / equity) * 100.0
@@ -780,7 +745,7 @@ impl MarketMakerState {
         };
 
         info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        info!("📊 IMPROVED MARKET MAKER STATUS");
+        info!("📊 AGGRESSIVE MM STATUS");
         info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         info!(
             "Market: Bid ${:.4} ({:.1}) / Ask ${:.4} ({:.1}) | Spread: ${:.4} ({:.2} bps)",
@@ -882,6 +847,7 @@ impl MarketMakerState {
     }
 }
 
+// IMPROVED: Much tighter spread calculation
 fn calculate_adaptive_spread(
     state: &MarketMakerState,
     base_spread_bps: f64,
@@ -890,57 +856,54 @@ fn calculate_adaptive_spread(
 ) -> f64 {
     let mut spread_multiplier = 1.0;
 
-    // 1. Volatility adjustment - more aggressive
+    // 1. Volatility adjustment - only widen on extreme volatility
     let volatility = state.volatility_tracker.get_volatility();
-    if volatility > 0.02 {
-        spread_multiplier *= 1.0 + (volatility - 0.02) * 30.0; // Increased from 20.0
+    if volatility > 0.04 {  // Only for extreme volatility
+        spread_multiplier *= 1.0 + (volatility - 0.04) * 15.0;
     }
 
-    // 2. Order book imbalance
+    // 2. Order book imbalance - reduced impact
     let imbalance = state.get_book_imbalance();
-    spread_multiplier *= 1.0 + imbalance.abs() * 0.5; // Increased from 0.3
+    spread_multiplier *= 1.0 + imbalance.abs() * 0.2;
 
-    // 3. Position risk
+    // 3. Position risk - only widen when really large
     let position_ratio = state.position.abs() / max_position;
-    spread_multiplier *= 1.0 + position_ratio * 0.7; // Increased from 0.5
+    if position_ratio > 0.7 {
+        spread_multiplier *= 1.0 + (position_ratio - 0.7) * 0.5;
+    }
 
-    // 4. TREND-BASED ADJUSTMENT - Much more aggressive
+    // 4. Trend adjustment - REDUCED from previous version
     let trend_strength = state.trend_detector.get_trend_strength();
-    let momentum_z = state.trend_detector.get_momentum_z_score();
     
     match state.current_regime {
         MarketRegime::Trending => {
-            // Widen significantly to avoid adverse selection
-            spread_multiplier *= 2.0 + trend_strength.abs() * 2.0; // Was 1.3 + 0.5
-            
-            // Additional widening for strong momentum
-            if momentum_z.abs() > 2.0 {
-                spread_multiplier *= 1.5;
-            }
+            // Only widen moderately in strong trends
+            spread_multiplier *= 1.2 + trend_strength.abs() * 0.3;
         }
         MarketRegime::Volatile => {
-            spread_multiplier *= 2.5; // Was 1.5
+            spread_multiplier *= 1.4;
         }
         MarketRegime::MeanReverting => {
-            spread_multiplier *= 0.9;
+            spread_multiplier *= 0.95;  // Tighten in mean reverting
         }
         MarketRegime::Calm => {
-            spread_multiplier *= 0.85;
+            spread_multiplier *= 0.9;  // Tighten in calm markets
         }
     }
 
-    // 5. Near liquidation - widen drastically
+    // 5. Near liquidation - widen significantly
     if state.is_near_liquidation(risk_limits.liquidation_buffer_pct) {
-        spread_multiplier *= 3.0;
+        spread_multiplier *= 2.0;
     }
 
-    // 6. Minimum spread covers fees with buffer
-    let min_spread_bps = state.maker_fee_rate * 2.0 * 10000.0 * 2.0; // 2x buffer
+    // 6. Minimum spread to cover fees
+    let min_spread_bps = state.maker_fee_rate * 2.0 * 10000.0 * 1.5;
     let target_spread_bps = (base_spread_bps * spread_multiplier).max(min_spread_bps);
 
     (state.mid_price * target_spread_bps) / 10000.0
 }
 
+// IMPROVED: Less aggressive inventory skewing
 fn calculate_dynamic_skew(
     state: &MarketMakerState,
     max_position: f64,
@@ -948,39 +911,35 @@ fn calculate_dynamic_skew(
     let position_ratio = state.position / max_position;
     let trend_strength = state.trend_detector.get_trend_strength();
     let momentum_z = state.trend_detector.get_momentum_z_score();
-    let flow_imbalance = state.trend_detector.get_flow_imbalance();
 
-    // 1. CRITICAL: Inventory management with trend awareness
-    let inventory_urgency = if position_ratio < -0.3 && trend_strength > 0.3 {
-        // Short in uptrend - VERY urgent to cover
-        -150.0 // Large negative skew = much tighter bids, much wider asks
-    } else if position_ratio > 0.3 && trend_strength < -0.3 {
-        // Long in downtrend - VERY urgent to sell
-        150.0 // Large positive skew = much wider bids, much tighter asks
-    } else if position_ratio.abs() > 0.5 {
-        // Just generally too much position
-        position_ratio.powi(3) * 100.0
+    // 1. Inventory management - less extreme
+    let inventory_urgency = if position_ratio.abs() > 0.7 {
+        // Only urgent when position is very large
+        position_ratio.powi(2) * 80.0
+    } else if position_ratio < -0.4 && trend_strength > 0.4 {
+        // Short in uptrend - cover moderately
+        -60.0
+    } else if position_ratio > 0.4 && trend_strength < -0.4 {
+        // Long in downtrend - sell moderately
+        60.0
     } else {
-        position_ratio.powi(3) * 50.0
+        position_ratio.powi(2) * position_ratio.signum() * 30.0
     };
 
-    // 2. Trend-based skew - only when NOT fighting position
-    let trend_skew_bps = if position_ratio * trend_strength < -0.1 {
-        // Position and trend are opposite - DON'T add trend bias
-        0.0
-    } else if position_ratio.abs() < 0.2 {
-        // Small position - can lean into trend
-        trend_strength * 20.0
+    // 2. Trend-based skew - only when not fighting position
+    let trend_skew_bps = if position_ratio * trend_strength < -0.2 {
+        0.0  // Don't add trend bias when opposite to position
+    } else if position_ratio.abs() < 0.3 {
+        trend_strength * 15.0  // Moderate trend following
     } else {
-        // Reduce trend bias when already positioned
-        trend_strength * 10.0
+        trend_strength * 8.0  // Reduced when positioned
     };
 
-    // 3. Mean reversion skew - fade extremes
+    // 3. Mean reversion - fade extremes
     let mean_revert_skew = match state.current_regime {
         MarketRegime::MeanReverting => {
             if momentum_z.abs() > 2.0 {
-                -momentum_z.signum() * 15.0 // Fade strong moves
+                -momentum_z.signum() * 10.0
             } else {
                 0.0
             }
@@ -991,36 +950,31 @@ fn calculate_dynamic_skew(
     let total_skew_bps = inventory_urgency + trend_skew_bps + mean_revert_skew;
     let skew_amount = state.mid_price * total_skew_bps / 10000.0;
 
-    // 4. Size adjustment based on regime and position
-    let mut size_multiplier = 1.0 - position_ratio.abs() * 0.6; // More aggressive reduction
+    // 4. Size adjustment - less reduction
+    let mut size_multiplier = 1.0 - position_ratio.abs() * 0.4;
     
     match state.current_regime {
         MarketRegime::Volatile => {
-            size_multiplier *= 0.6; // Was 0.7
+            size_multiplier *= 0.75;
         }
         MarketRegime::Calm => {
-            size_multiplier *= 1.3; // Was 1.2
+            size_multiplier *= 1.2;
         }
         MarketRegime::Trending => {
-            // Reduce size in trends to avoid adverse selection
-            size_multiplier *= 0.8;
+            size_multiplier *= 0.9;  // Less reduction
         }
         _ => {}
     }
 
-    // 5. Asymmetric sizing based on position and trend
-    let (bid_size_adj, ask_size_adj) = if position_ratio < -0.3 && trend_strength > 0.3 {
-        // Short in uptrend - want to buy back aggressively
-        (1.5, 0.5)
-    } else if position_ratio > 0.3 && trend_strength < -0.3 {
-        // Long in downtrend - want to sell aggressively
-        (0.5, 1.5)
-    } else if trend_strength > 0.4 {
-        // Uptrend - prefer buying
-        (1.3, 0.7)
-    } else if trend_strength < -0.4 {
-        // Downtrend - prefer selling
+    // 5. Asymmetric sizing - less aggressive
+    let (bid_size_adj, ask_size_adj) = if position_ratio < -0.5 && trend_strength > 0.4 {
+        (1.3, 0.7)  // Less extreme
+    } else if position_ratio > 0.5 && trend_strength < -0.4 {
         (0.7, 1.3)
+    } else if trend_strength > 0.5 {
+        (1.15, 0.85)
+    } else if trend_strength < -0.5 {
+        (0.85, 1.15)
     } else {
         (1.0, 1.0)
     };
@@ -1028,6 +982,7 @@ fn calculate_dynamic_skew(
     (skew_amount, size_multiplier, bid_size_adj, ask_size_adj)
 }
 
+// IMPROVED: Less restrictive order placement
 fn should_place_order(
     state: &MarketMakerState,
     is_buy: bool,
@@ -1038,14 +993,12 @@ fn should_place_order(
     let trend_strength = state.trend_detector.get_trend_strength();
     let position_ratio = state.position / max_position;
 
-    // 1. Don't add to position when fighting strong trends
-    if !is_buy && position_ratio < -0.4 && trend_strength > 0.4 {
-        // Already short in strong uptrend - don't sell more
+    // 1. Only block if VERY strongly fighting trends AND large position
+    if !is_buy && position_ratio < -0.6 && trend_strength > 0.6 {
         return false;
     }
     
-    if is_buy && position_ratio > 0.4 && trend_strength < -0.4 {
-        // Already long in strong downtrend - don't buy more
+    if is_buy && position_ratio > 0.6 && trend_strength < -0.6 {
         return false;
     }
 
@@ -1064,7 +1017,7 @@ fn should_place_order(
     let required_margin = notional / state.leverage;
     let available_margin = state.get_available_margin();
     
-    if required_margin > available_margin * 0.9 {
+    if required_margin > available_margin * 0.95 {
         return false;
     }
 
@@ -1079,6 +1032,7 @@ fn should_place_order(
     true
 }
 
+// IMPROVED: Update more frequently
 fn should_update_orders(
     state: &MarketMakerState,
     last_mid: f64,
@@ -1098,20 +1052,14 @@ fn should_update_orders(
         }
     }
 
-    // Position management - more urgent when large
-    if state.position.abs() > max_position * 0.5 {
+    // Large position - update less frequently to avoid over-trading
+    if state.position.abs() > max_position * 0.8 {
         return true;
     }
 
-    // High volatility
+    // High volatility - update more to stay competitive
     let volatility = state.volatility_tracker.get_volatility();
-    if volatility > 0.03 {
-        return true;
-    }
-
-    // Trend changes - update more frequently in strong trends
-    let trend_strength = state.trend_detector.get_trend_strength().abs();
-    if trend_strength > 0.4 {
+    if volatility > 0.04 {
         return true;
     }
 
@@ -1120,6 +1068,7 @@ fn should_update_orders(
         return true;
     }
 
+    // Update more frequently in general
     false
 }
 
@@ -1163,7 +1112,6 @@ fn place_adaptive_orders(
     let trend_strength = state.trend_detector.get_trend_strength();
     let regime_str = format!("{:?}", state.current_regime);
 
-    // Check if we should place bid
     let can_place_bid = should_place_order(state, true, bid_size, max_position, risk_limits);
     
     if can_place_bid && bid_size >= 0.01 {
@@ -1177,7 +1125,6 @@ fn place_adaptive_orders(
         info!("⚠️  Skipping bid - risk management");
     }
 
-    // Check if we should place ask
     let can_place_ask = should_place_order(state, false, ask_size, max_position, risk_limits);
     
     if can_place_ask && ask_size >= 0.01 {
@@ -1204,20 +1151,20 @@ async fn main() {
     let initial_capital = 500.0;
     let leverage = 10.0;
 
-    // Market making parameters - more conservative
-    let base_order_size = 1.0;  // Reduced from 3.0
-    let base_spread_bps = 30.0; // Increased from 20.0
-    let max_position = 30.0;    // Reduced from 50.0 - more conservative
-    let update_threshold_pct = 0.0015; // 0.15% - slightly tighter
+    // IMPROVED: More aggressive parameters for better flow capture
+    let base_order_size = 15.0;  // Much larger orders
+    let base_spread_bps = 6.0;   // Tight base spread
+    let max_position = 100.0;    // Higher position limit
+    let update_threshold_pct = 0.0008; // 0.08% - update more frequently
     let status_interval = 25;
 
-    // Risk limits
+    // Risk limits - balanced
     let risk_limits = RiskLimits {
         max_position_size: max_position,
-        max_loss_per_day: 100.0, // $100 loss limit (20% of capital)
-        max_drawdown_pct: 15.0,
+        max_loss_per_day: 150.0,
+        max_drawdown_pct: 20.0,
         startup_grace_period_ms: 120000,
-        max_margin_usage_pct: 80.0, // Don't use more than 80% of capital as margin
+        max_margin_usage_pct: 85.0,
         liquidation_buffer_pct: 10.0,
     };
 
@@ -1263,30 +1210,26 @@ async fn main() {
         .await
         .unwrap();
 
-    info!("🤖 IMPROVED MARKET MAKER Started for {}", coin);
+    info!("🤖 AGGRESSIVE MARKET MAKER Started for {}", coin);
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     info!("💰 CAPITAL MANAGEMENT");
     info!("   Initial Capital: ${:.2}", initial_capital);
     info!("   Leverage: {}x", leverage);
     info!("   Max Buying Power: ${:.2}", initial_capital * leverage);
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    info!("🧠 STRATEGY");
-    info!("   Base Order Size: {} HYPE", base_order_size);
-    info!("   Base Spread: {:.1} bps (adaptive)", base_spread_bps);
-    info!("   Max Position: ±{} HYPE", max_position);
+    info!("🧠 AGGRESSIVE STRATEGY");
+    info!("   Base Order Size: {} HYPE (LARGE)", base_order_size);
+    info!("   Base Spread: {:.1} bps (TIGHT)", base_spread_bps);
+    info!("   Max Position: ±{} HYPE (HIGH)", max_position);
     info!("   Maker Fee: {:.3}%", state.maker_fee_rate * 100.0);
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    info!("⚠️  RISK LIMITS");
-    info!("   Max Daily Loss: ${:.2}", risk_limits.max_loss_per_day);
-    info!("   Max Drawdown: {:.1}%", risk_limits.max_drawdown_pct);
-    info!("   Max Margin Usage: {:.1}%", risk_limits.max_margin_usage_pct);
-    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     info!("🎯 KEY IMPROVEMENTS");
-    info!("   ✓ Proper leverage & margin tracking");
-    info!("   ✓ Wider spreads to avoid adverse selection");
-    info!("   ✓ Position-aware order placement");
-    info!("   ✓ Don't fight strong trends");
-    info!("   ✓ Liquidation monitoring");
+    info!("   ✓ MUCH tighter spreads (6 bps vs 30 bps)");
+    info!("   ✓ MUCH larger sizes (15 vs 1.0)");
+    info!("   ✓ Higher position limits (100 vs 30)");
+    info!("   ✓ Less restrictive order placement");
+    info!("   ✓ More frequent updates");
+    info!("   ✓ Better flow capture strategy");
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     while let Some(message) = receiver.recv().await {
