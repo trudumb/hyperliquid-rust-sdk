@@ -720,8 +720,7 @@ impl MarketMakerState {
                 }
             }
         } else if !violations.is_empty() {
-            info!("⏱️  In grace period ({:.1}s remaining) - some checks suspended",
-                (limits.startup_grace_period_ms - time_elapsed) as f64 / 1000.0);
+
         }
 
         (is_safe, violations)
