@@ -395,33 +395,38 @@ impl MarketMakerState {
 
     fn update_margin(&mut self) {
         if self.position != 0.0 {
-            let position_notional = self.position.abs() * self.average_entry;
+            let position_size = self.position.abs();
+            let position_notional = position_size * self.average_entry;
             
-            // Initial margin required for this position
+            // Initial margin for the position
             self.margin_used = position_notional / self.leverage;
             
-            // Maintenance margin is half of initial margin at max leverage
-            // For leverage L, initial margin = 1/L, so maintenance = 1/(2*L)
-            let maintenance_margin_ratio = 1.0 / (2.0 * self.leverage);
-            let maintenance_margin = position_notional * maintenance_margin_ratio;
-            
-            // Calculate liquidation price
-            // For LONG: liquidation when (equity = maintenance_margin)
-            // equity = initial_margin + unrealized_pnl
-            // unrealized_pnl = (current_price - entry_price) * position_size
-            // At liquidation: initial_margin + (liq_price - entry_price) * position_size = maintenance_margin
-            // Solving for liq_price:
+            // Calculate liquidation price based on total account value
+            // Account capital available (excluding unrealized PnL)
+            let account_capital = self.initial_capital + self.realized_pnl - self.total_fees_paid;
             
             if self.position > 0.0 {
-                // Long position
-                // liq_price = entry_price - (initial_margin - maintenance_margin) / position_size
-                let margin_buffer = self.margin_used - maintenance_margin;
-                self.liquidation_price = self.average_entry - (margin_buffer / self.position);
+                // LONG position liquidation formula:
+                // At liq: account_capital + (liq_price - entry) * size = liq_price * size / (2 * leverage)
+                // Solving: liq_price = (account_capital - entry * size) / (size * ((1/(2*leverage)) - 1))
+                
+                let numerator = account_capital - self.average_entry * position_size;
+                let denominator = position_size * ((1.0 / (2.0 * self.leverage)) - 1.0);
+                
+                if denominator.abs() < 1e-10 {
+                    // Avoid division by zero - very high leverage
+                    self.liquidation_price = 0.0;
+                } else {
+                    self.liquidation_price = numerator / denominator;
+                }
             } else {
-                // Short position
-                // liq_price = entry_price + (initial_margin - maintenance_margin) / |position_size|
-                let margin_buffer = self.margin_used - maintenance_margin;
-                self.liquidation_price = self.average_entry + (margin_buffer / self.position.abs());
+                // SHORT position liquidation formula:
+                // At liq: account_capital + (entry - liq_price) * size = liq_price * size / (2 * leverage)
+                // Solving: liq_price = (account_capital + entry * size) / (size * (1 + 1/(2*leverage)))
+                
+                let numerator = account_capital + self.average_entry * position_size;
+                let denominator = position_size * (1.0 + 1.0 / (2.0 * self.leverage));
+                self.liquidation_price = numerator / denominator;
             }
             
             // Ensure liquidation price is positive
@@ -481,10 +486,10 @@ impl MarketMakerState {
         let buffer_multiplier = 1.0 + (buffer_pct / 100.0);
 
         if self.position > 0.0 {
-            // Long position: check if price is close to liquidation price below
+            // Long position: liquidation price is BELOW entry, check if current price is approaching it
             self.mid_price < self.liquidation_price * buffer_multiplier
         } else {
-            // Short position: check if price is close to liquidation price above
+            // Short position: liquidation price is ABOVE entry, check if current price is approaching it  
             self.mid_price > self.liquidation_price / buffer_multiplier
         }
     }
