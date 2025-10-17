@@ -656,7 +656,8 @@ impl MarketMakerState {
 
             self.position += order.size;
 
-            if old_position < 0.0 && self.position >= 0.0 {
+            // Closing or reducing short position
+            if old_position < 0.0 {
                 let closed_size = old_position.abs().min(order.size);
                 let pnl = (old_avg_entry - fill_price) * closed_size - fee;
                 self.realized_pnl += pnl;
@@ -667,12 +668,22 @@ impl MarketMakerState {
                     self.losing_fills += 1;
                 }
 
+                // If we still have position after closing, set new entry
                 if self.position > 0.0 {
                     self.average_entry = fill_price;
+                } else if self.position == 0.0 {
+                    self.average_entry = 0.0;
+                } else {
+                    // Still short, average entry stays the same
                 }
-            } else if old_position >= 0.0 {
+            } 
+            // Opening or adding to long position
+            else if old_position >= 0.0 {
                 self.average_entry =
                     (old_avg_entry * old_position + fill_price * order.size) / self.position;
+                
+                // Count as "neutral" - not a win or loss yet, just opening
+                // Don't increment profitable/losing counters
             }
 
             format!(
@@ -687,7 +698,8 @@ impl MarketMakerState {
 
             self.position -= order.size;
 
-            if old_position > 0.0 && self.position <= 0.0 {
+            // Closing or reducing long position
+            if old_position > 0.0 {
                 let closed_size = old_position.min(order.size);
                 let pnl = (fill_price - old_avg_entry) * closed_size - fee;
                 self.realized_pnl += pnl;
@@ -698,12 +710,22 @@ impl MarketMakerState {
                     self.losing_fills += 1;
                 }
 
+                // If we still have position after closing, set new entry
                 if self.position < 0.0 {
                     self.average_entry = fill_price;
+                } else if self.position == 0.0 {
+                    self.average_entry = 0.0;
+                } else {
+                    // Still long, average entry stays the same
                 }
-            } else if old_position <= 0.0 {
+            } 
+            // Opening or adding to short position
+            else if old_position <= 0.0 {
                 self.average_entry = (old_avg_entry * old_position.abs() + fill_price * order.size)
                     / self.position.abs();
+                
+                // Count as "neutral" - not a win or loss yet, just opening
+                // Don't increment profitable/losing counters
             }
 
             format!(
@@ -736,7 +758,7 @@ impl MarketMakerState {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let time_elapsed = now - self.session_start_time;
+        let time_elapsed = now.saturating_sub(self.session_start_time);
         let in_grace_period = time_elapsed < limits.startup_grace_period_ms;
 
         let equity = self.current_capital + self.unrealized_pnl;
@@ -827,14 +849,6 @@ impl MarketMakerState {
         let toxicity_prob = self.flow_analyzer.get_toxicity_probability(10.0);
         let (buy_ratio, dir_confidence) = self.flow_analyzer.get_directional_toxicity(30.0);
         let bayesian_confidence = self.bayesian_estimator.get_confidence();
-
-        let win_rate = if self.profitable_fills + self.losing_fills > 0 {
-            (self.profitable_fills as f64
-                / (self.profitable_fills + self.losing_fills) as f64)
-                * 100.0
-        } else {
-            0.0
-        };
 
         let equity = self.current_capital + self.unrealized_pnl;
         let margin_usage_pct = if equity > 0.0 {
@@ -950,10 +964,17 @@ impl MarketMakerState {
             "Fills: {} total ({} buys, {} sells)",
             self.total_fills, self.buy_fills, self.sell_fills
         );
-        info!(
-            "Win Rate: {:.1}% ({} wins, {} losses)",
-            win_rate, self.profitable_fills, self.losing_fills
-        );
+        
+        let closed_trades = self.profitable_fills + self.losing_fills;
+        if closed_trades > 0 {
+            let win_rate = (self.profitable_fills as f64 / closed_trades as f64) * 100.0;
+            info!(
+                "Closed Trades: {} ({} wins, {} losses) | Win Rate: {:.1}%",
+                closed_trades, self.profitable_fills, self.losing_fills, win_rate
+            );
+        } else {
+            info!("Closed Trades: 0 (all fills are opening new positions)");
+        }
 
         if self.total_fills > 0 {
             let pnl_per_fill = net_pnl / self.total_fills as f64;
@@ -1002,8 +1023,8 @@ fn poisson_tail_probability(lambda: f64, k: u64) -> f64 {
 
 fn calculate_minimum_spread(state: &MarketMakerState) -> f64 {
     let fee_coverage = state.maker_fee_rate * 2.0 * 10000.0;
-    let adverse_selection_buffer = 15.0;
-    let min_profit_target = 5.0;
+    let adverse_selection_buffer = 1.0;  // Very tight for HYPE
+    let min_profit_target = 0.5;  // Minimal profit target
     
     fee_coverage + adverse_selection_buffer + min_profit_target
 }
@@ -1033,7 +1054,7 @@ fn calculate_expected_value_spread(
     
     // 4. Adverse selection adjustment using Bayesian probability
     let toxic_prob = state.bayesian_estimator.prob_toxic_flow;
-    let adverse_selection_cost = toxic_prob * 20.0;  // Up to 20 bps cost
+    let adverse_selection_cost = toxic_prob * 2.0;  // Very low for HYPE
     spread_bps += adverse_selection_cost;
     
     // 5. Directional flow adjustment
@@ -1108,9 +1129,17 @@ fn should_place_order(
     max_position: f64,
     risk_limits: &RiskLimits,
 ) -> (bool, String) {
+    // Special case: if we have a large position and this order reduces it, be more lenient
+    let is_reducing_position = (is_buy && state.position < -5.0) || (!is_buy && state.position > 5.0);
+    let ev_threshold = if is_reducing_position {
+        risk_limits.min_expected_value_bps * 0.2  // Much more lenient for reducing positions
+    } else {
+        risk_limits.min_expected_value_bps
+    };
+    
     // 1. Check minimum expected value
-    if expected_value_bps < risk_limits.min_expected_value_bps {
-        return (false, format!("EV too low: {:.2} < {:.2} bps", expected_value_bps, risk_limits.min_expected_value_bps));
+    if expected_value_bps < ev_threshold {
+        return (false, format!("EV too low: {:.2} < {:.2} bps", expected_value_bps, ev_threshold));
     }
 
     // 2. Check toxic flow probability
@@ -1130,12 +1159,12 @@ fn should_place_order(
         }
     }
 
-    // 4. Position limits
+    // 4. Position limits (but allow reducing orders)
     let position_ratio = state.position / max_position;
-    if is_buy && position_ratio > 0.8 {
+    if is_buy && position_ratio > 0.8 && !is_reducing_position {
         return (false, "Near max long position".to_string());
     }
-    if !is_buy && position_ratio < -0.8 {
+    if !is_buy && position_ratio < -0.8 && !is_reducing_position {
         return (false, "Near max short position".to_string());
     }
 
@@ -1178,28 +1207,43 @@ fn should_update_orders(
         return true;
     }
 
-    // Price movement
+    // Price movement - increased threshold to reduce churn
     if last_mid > 0.0 {
         let price_change_pct = ((state.mid_price - last_mid) / last_mid).abs();
-        if price_change_pct > threshold_pct {
+        if price_change_pct > threshold_pct * 5.0 {  // 5x higher threshold (1% instead of 0.2%)
             return true;
         }
     }
 
-    // Bayesian state change
+    // Check if our orders are now far from mid
+    if let Some(bid) = &state.our_bid_order {
+        let bid_edge_bps = ((state.mid_price - bid.price) / state.mid_price) * 10000.0;
+        if bid_edge_bps > 100.0 || bid_edge_bps < 2.0 {  // Too far or too close
+            return true;
+        }
+    }
+    
+    if let Some(ask) = &state.our_ask_order {
+        let ask_edge_bps = ((ask.price - state.mid_price) / state.mid_price) * 10000.0;
+        if ask_edge_bps > 100.0 || ask_edge_bps < 2.0 {  // Too far or too close
+            return true;
+        }
+    }
+
+    // Time-based update - much longer interval
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
     let time_since_update = (now - state.last_update_ts) as f64 / 1000.0;
     
-    if time_since_update > 30.0 {  // Update every 30 seconds at minimum
+    if time_since_update > 60.0 {  // Update every 60 seconds instead of 30
         return true;
     }
 
-    // Significant change in toxic probability
+    // Only cancel on VERY toxic flow
     let toxic_prob = state.bayesian_estimator.prob_toxic_flow;
-    if toxic_prob > 0.6 {
+    if toxic_prob > 0.85 {  // Raised from 0.6 to 0.85
         return true;
     }
 
@@ -1284,22 +1328,36 @@ fn place_probabilistic_orders(
 fn should_stop_trading(state: &MarketMakerState) -> bool {
     let net_pnl = state.realized_pnl + state.unrealized_pnl - state.total_fees_paid;
     
+    // Stop if significant loss
     if net_pnl < -100.0 {
         info!("🛑 Stopping: Daily loss limit hit (${:.2})", net_pnl);
         return true;
     }
     
-    if state.total_fills > 20 && state.total_fees_paid > state.realized_pnl.abs() * 0.5 {
-        info!("🛑 Stopping: Fees eating >50% of gross profit");
-        return true;
-    }
-    
-    if state.total_fills > 10 {
-        let win_rate = state.profitable_fills as f64 / state.total_fills as f64;
-        if win_rate < 0.45 {
-            info!("🛑 Stopping: Win rate too low ({:.1}%)", win_rate * 100.0);
+    // Stop if fees are eating all profits
+    if state.total_fills > 20 && state.realized_pnl > 1.0 {
+        let fee_ratio = state.total_fees_paid / state.realized_pnl.abs();
+        if fee_ratio > 0.8 {
+            info!("🛑 Stopping: Fees eating >80% of gross profit");
             return true;
         }
+    }
+    
+    // Only check win rate if we have CLOSED positions (profitable_fills + losing_fills > 0)
+    let closed_trades = state.profitable_fills + state.losing_fills;
+    if closed_trades >= 10 {
+        let win_rate = state.profitable_fills as f64 / closed_trades as f64;
+        if win_rate < 0.35 {
+            info!("🛑 Stopping: Win rate too low ({:.1}% over {} closed trades)", 
+                  win_rate * 100.0, closed_trades);
+            return true;
+        }
+    }
+    
+    // Stop if unrealized loss is very large (position going against us)
+    if state.unrealized_pnl < -50.0 {
+        info!("🛑 Stopping: Large unrealized loss (${:.2})", state.unrealized_pnl);
+        return true;
     }
     
     false
@@ -1317,7 +1375,7 @@ async fn main() {
 
     // Probabilistic MM Configuration
     let base_order_size = 3.0;
-    let base_spread_bps = 25.0;
+    let base_spread_bps = 3.0;  // Ultra-tight for HYPE's sub-1bps spreads
     let max_position = 30.0;
     let update_threshold_pct = 0.002;
     let status_interval = 5;
@@ -1329,7 +1387,7 @@ async fn main() {
         startup_grace_period_ms: 120000,
         max_margin_usage_pct: 75.0,
         liquidation_buffer_pct: 15.0,
-        min_expected_value_bps: 3.0,  // Minimum 3 bps expected value
+        min_expected_value_bps: 0.05,  // Very low threshold for ultra-tight markets
     };
 
     let mut info_client = InfoClient::new(None, Some(BaseUrl::Mainnet))
