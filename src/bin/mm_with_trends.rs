@@ -228,11 +228,11 @@ impl TrendDetector {
         let trend_strength = self.get_trend_strength().abs();
         let z_score = self.get_momentum_z_score().abs();
 
-        if volatility > 0.04 {  // Raised threshold
+        if volatility > 0.04 {
             return MarketRegime::Volatile;
         }
 
-        if trend_strength > 0.5 || z_score > 2.5 {  // Raised thresholds
+        if trend_strength > 0.5 || z_score > 2.5 {
             return MarketRegime::Trending;
         }
 
@@ -744,8 +744,15 @@ impl MarketMakerState {
             0.0
         };
 
+        // Calculate fee-to-profit ratio
+        let fee_ratio = if self.realized_pnl.abs() > 0.01 {
+            (self.total_fees_paid / self.realized_pnl.abs()) * 100.0
+        } else {
+            0.0
+        };
+
         info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        info!("📊 AGGRESSIVE MM STATUS");
+        info!("📊 PROFITABLE MM STATUS");
         info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         info!(
             "Market: Bid ${:.4} ({:.1}) / Ask ${:.4} ({:.1}) | Spread: ${:.4} ({:.2} bps)",
@@ -819,7 +826,7 @@ impl MarketMakerState {
         );
         info!("Realized PnL: ${:.2}", self.realized_pnl);
         info!("Unrealized PnL: ${:.2}", self.unrealized_pnl);
-        info!("Fees Paid: ${:.2}", self.total_fees_paid);
+        info!("Fees Paid: ${:.2} (Fee Ratio: {:.1}%)", self.total_fees_paid, fee_ratio);
         info!("Net PnL: ${:.2}", net_pnl);
         
         if self.peak_pnl >= 5.0 {
@@ -847,63 +854,103 @@ impl MarketMakerState {
     }
 }
 
-// IMPROVED: Much tighter spread calculation
+// NEW: Calculate minimum profitable spread
+fn calculate_minimum_spread(state: &MarketMakerState) -> f64 {
+    // Minimum spread = 2x maker fees + safety margin
+    let fee_coverage = state.maker_fee_rate * 2.0 * 10000.0;  // ~3 bps
+    let adverse_selection_buffer = 15.0;  // 15 bps buffer for toxic flow
+    let min_profit_target = 5.0;  // 5 bps minimum profit
+    
+    fee_coverage + adverse_selection_buffer + min_profit_target  // ~23 bps minimum
+}
+
+// NEW: Detect toxic/adverse flow
+fn detect_toxic_flow(state: &MarketMakerState) -> bool {
+    let imbalance = state.trend_detector.get_flow_imbalance().abs();
+    
+    // Toxic if:
+    // 1. Heavy one-sided flow (>70% imbalance)
+    // 2. High volatility
+    // 3. Strong trend
+    imbalance > 0.7 || 
+    state.volatility_tracker.get_volatility() > 0.02 ||
+    state.trend_detector.get_trend_strength().abs() > 0.6
+}
+
+// NEW: Check if we should stop trading based on performance
+fn should_stop_trading(state: &MarketMakerState) -> bool {
+    let net_pnl = state.realized_pnl + state.unrealized_pnl - state.total_fees_paid;
+    
+    // Stop if:
+    // 1. Daily loss limit hit
+    if net_pnl < -100.0 { 
+        info!("🛑 Stopping: Daily loss limit hit (${:.2})", net_pnl);
+        return true; 
+    }
+    
+    // 2. Negative PnL with high fee ratio
+    if state.total_fills > 20 && 
+       state.total_fees_paid > state.realized_pnl.abs() * 0.5 {
+        info!("🛑 Stopping: Fees eating >50% of gross profit");
+        return true;
+    }
+    
+    // 3. Win rate too low
+    if state.total_fills > 10 {
+        let win_rate = state.profitable_fills as f64 / state.total_fills as f64;
+        if win_rate < 0.45 { 
+            info!("🛑 Stopping: Win rate too low ({:.1}%)", win_rate * 100.0);
+            return true; 
+        }
+    }
+    
+    false
+}
+
+// IMPROVED: Conservative spread calculation for profitability
 fn calculate_adaptive_spread(
     state: &MarketMakerState,
     base_spread_bps: f64,
     max_position: f64,
     risk_limits: &RiskLimits,
 ) -> f64 {
-    let mut spread_multiplier = 1.0;
-
-    // 1. Volatility adjustment - only widen on extreme volatility
-    let volatility = state.volatility_tracker.get_volatility();
-    if volatility > 0.04 {  // Only for extreme volatility
-        spread_multiplier *= 1.0 + (volatility - 0.04) * 15.0;
-    }
-
-    // 2. Order book imbalance - reduced impact
-    let imbalance = state.get_book_imbalance();
-    spread_multiplier *= 1.0 + imbalance.abs() * 0.2;
-
-    // 3. Position risk - only widen when really large
-    let position_ratio = state.position.abs() / max_position;
-    if position_ratio > 0.7 {
-        spread_multiplier *= 1.0 + (position_ratio - 0.7) * 0.5;
-    }
-
-    // 4. Trend adjustment - REDUCED from previous version
-    let trend_strength = state.trend_detector.get_trend_strength();
+    let mut spread_bps = base_spread_bps;
     
-    match state.current_regime {
-        MarketRegime::Trending => {
-            // Only widen moderately in strong trends
-            spread_multiplier *= 1.2 + trend_strength.abs() * 0.3;
-        }
-        MarketRegime::Volatile => {
-            spread_multiplier *= 1.4;
-        }
-        MarketRegime::MeanReverting => {
-            spread_multiplier *= 0.95;  // Tighten in mean reverting
-        }
-        MarketRegime::Calm => {
-            spread_multiplier *= 0.9;  // Tighten in calm markets
-        }
+    // 1. Minimum profitable spread
+    let min_spread = calculate_minimum_spread(state);
+    spread_bps = spread_bps.max(min_spread);
+    
+    // 2. Volatility adjustment - be more conservative
+    let volatility = state.volatility_tracker.get_volatility();
+    if volatility > 0.01 {  // Lower threshold
+        spread_bps *= 1.0 + volatility * 50.0;  // Stronger adjustment
     }
-
+    
+    // 3. Inventory risk - widen spread as position grows
+    let position_ratio = (state.position.abs() / max_position).min(1.0);
+    spread_bps *= 1.0 + position_ratio.powi(2) * 0.5;
+    
+    // 4. Adverse selection detection
+    let flow_imbalance = state.trend_detector.get_flow_imbalance().abs();
+    if flow_imbalance > 0.5 {
+        spread_bps *= 1.5;  // Widen significantly on toxic flow
+    }
+    
     // 5. Near liquidation - widen significantly
     if state.is_near_liquidation(risk_limits.liquidation_buffer_pct) {
-        spread_multiplier *= 2.0;
+        spread_bps *= 2.0;
     }
 
-    // 6. Minimum spread to cover fees
-    let min_spread_bps = state.maker_fee_rate * 2.0 * 10000.0 * 1.5;
-    let target_spread_bps = (base_spread_bps * spread_multiplier).max(min_spread_bps);
+    // 6. Strong trend detection - avoid adverse selection
+    let trend_strength = state.trend_detector.get_trend_strength().abs();
+    if trend_strength > 0.5 {
+        spread_bps *= 1.3;
+    }
 
-    (state.mid_price * target_spread_bps) / 10000.0
+    (state.mid_price * spread_bps) / 10000.0
 }
 
-// IMPROVED: Less aggressive inventory skewing
+// IMPROVED: More conservative inventory management
 fn calculate_dynamic_skew(
     state: &MarketMakerState,
     max_position: f64,
@@ -912,27 +959,27 @@ fn calculate_dynamic_skew(
     let trend_strength = state.trend_detector.get_trend_strength();
     let momentum_z = state.trend_detector.get_momentum_z_score();
 
-    // 1. Inventory management - less extreme
-    let inventory_urgency = if position_ratio.abs() > 0.7 {
-        // Only urgent when position is very large
-        position_ratio.powi(2) * 80.0
-    } else if position_ratio < -0.4 && trend_strength > 0.4 {
-        // Short in uptrend - cover moderately
-        -60.0
-    } else if position_ratio > 0.4 && trend_strength < -0.4 {
-        // Long in downtrend - sell moderately
-        60.0
+    // 1. Inventory management - moderate urgency
+    let inventory_urgency = if position_ratio.abs() > 0.5 {
+        // Urgent when position is large (reduced from 0.7)
+        position_ratio.powi(2) * 100.0
+    } else if position_ratio < -0.3 && trend_strength > 0.4 {
+        // Short in uptrend - cover
+        -80.0
+    } else if position_ratio > 0.3 && trend_strength < -0.4 {
+        // Long in downtrend - sell
+        80.0
     } else {
-        position_ratio.powi(2) * position_ratio.signum() * 30.0
+        position_ratio.powi(2) * position_ratio.signum() * 40.0
     };
 
     // 2. Trend-based skew - only when not fighting position
     let trend_skew_bps = if position_ratio * trend_strength < -0.2 {
         0.0  // Don't add trend bias when opposite to position
     } else if position_ratio.abs() < 0.3 {
-        trend_strength * 15.0  // Moderate trend following
+        trend_strength * 12.0  // Moderate trend following
     } else {
-        trend_strength * 8.0  // Reduced when positioned
+        trend_strength * 6.0  // Reduced when positioned
     };
 
     // 3. Mean reversion - fade extremes
@@ -950,31 +997,31 @@ fn calculate_dynamic_skew(
     let total_skew_bps = inventory_urgency + trend_skew_bps + mean_revert_skew;
     let skew_amount = state.mid_price * total_skew_bps / 10000.0;
 
-    // 4. Size adjustment - less reduction
-    let mut size_multiplier = 1.0 - position_ratio.abs() * 0.4;
+    // 4. Size adjustment
+    let mut size_multiplier = 1.0 - position_ratio.abs() * 0.5;
     
     match state.current_regime {
         MarketRegime::Volatile => {
-            size_multiplier *= 0.75;
+            size_multiplier *= 0.7;
         }
         MarketRegime::Calm => {
-            size_multiplier *= 1.2;
+            size_multiplier *= 1.1;
         }
         MarketRegime::Trending => {
-            size_multiplier *= 0.9;  // Less reduction
+            size_multiplier *= 0.85;
         }
         _ => {}
     }
 
-    // 5. Asymmetric sizing - less aggressive
-    let (bid_size_adj, ask_size_adj) = if position_ratio < -0.5 && trend_strength > 0.4 {
-        (1.3, 0.7)  // Less extreme
-    } else if position_ratio > 0.5 && trend_strength < -0.4 {
-        (0.7, 1.3)
-    } else if trend_strength > 0.5 {
-        (1.15, 0.85)
-    } else if trend_strength < -0.5 {
-        (0.85, 1.15)
+    // 5. Asymmetric sizing
+    let (bid_size_adj, ask_size_adj) = if position_ratio < -0.4 && trend_strength > 0.4 {
+        (1.2, 0.8)
+    } else if position_ratio > 0.4 && trend_strength < -0.4 {
+        (0.8, 1.2)
+    } else if trend_strength > 0.4 {
+        (1.1, 0.9)
+    } else if trend_strength < -0.4 {
+        (0.9, 1.1)
     } else {
         (1.0, 1.0)
     };
@@ -982,7 +1029,7 @@ fn calculate_dynamic_skew(
     (skew_amount, size_multiplier, bid_size_adj, ask_size_adj)
 }
 
-// IMPROVED: Less restrictive order placement
+// IMPROVED: More conservative order placement
 fn should_place_order(
     state: &MarketMakerState,
     is_buy: bool,
@@ -993,16 +1040,21 @@ fn should_place_order(
     let trend_strength = state.trend_detector.get_trend_strength();
     let position_ratio = state.position / max_position;
 
-    // 1. Only block if VERY strongly fighting trends AND large position
-    if !is_buy && position_ratio < -0.6 && trend_strength > 0.6 {
-        return false;
-    }
-    
-    if is_buy && position_ratio > 0.6 && trend_strength < -0.6 {
+    // 1. Avoid toxic flow completely
+    if detect_toxic_flow(state) {
         return false;
     }
 
-    // 2. Near liquidation - only reduce position
+    // 2. Don't fight strong trends with large position
+    if !is_buy && position_ratio < -0.5 && trend_strength > 0.5 {
+        return false;
+    }
+    
+    if is_buy && position_ratio > 0.5 && trend_strength < -0.5 {
+        return false;
+    }
+
+    // 3. Near liquidation - only reduce position
     if state.is_near_liquidation(risk_limits.liquidation_buffer_pct) {
         if is_buy && state.position >= 0.0 {
             return false;
@@ -1012,7 +1064,7 @@ fn should_place_order(
         }
     }
 
-    // 3. Check margin availability
+    // 4. Check margin availability
     let notional = state.mid_price * size;
     let required_margin = notional / state.leverage;
     let available_margin = state.get_available_margin();
@@ -1021,7 +1073,7 @@ fn should_place_order(
         return false;
     }
 
-    // 4. Position limits
+    // 5. Position limits
     if is_buy && state.position + size > max_position {
         return false;
     }
@@ -1032,7 +1084,7 @@ fn should_place_order(
     true
 }
 
-// IMPROVED: Update more frequently
+// IMPROVED: Update based on price movement and conditions
 fn should_update_orders(
     state: &MarketMakerState,
     last_mid: f64,
@@ -1052,14 +1104,14 @@ fn should_update_orders(
         }
     }
 
-    // Large position - update less frequently to avoid over-trading
-    if state.position.abs() > max_position * 0.8 {
+    // Large position - update to manage inventory
+    if state.position.abs() > max_position * 0.5 {
         return true;
     }
 
-    // High volatility - update more to stay competitive
+    // High volatility
     let volatility = state.volatility_tracker.get_volatility();
-    if volatility > 0.04 {
+    if volatility > 0.03 {
         return true;
     }
 
@@ -1068,7 +1120,11 @@ fn should_update_orders(
         return true;
     }
 
-    // Update more frequently in general
+    // Toxic flow detected
+    if detect_toxic_flow(state) {
+        return true;
+    }
+
     false
 }
 
@@ -1122,7 +1178,7 @@ fn place_adaptive_orders(
         );
         state.our_bid_order = Some(bid_order);
     } else if !can_place_bid {
-        info!("⚠️  Skipping bid - risk management");
+        info!("⚠️  Skipping bid - risk/flow management");
     }
 
     let can_place_ask = should_place_order(state, false, ask_size, max_position, risk_limits);
@@ -1135,7 +1191,7 @@ fn place_adaptive_orders(
         );
         state.our_ask_order = Some(ask_order);
     } else if !can_place_ask {
-        info!("⚠️  Skipping ask - risk management");
+        info!("⚠️  Skipping ask - risk/flow management");
     }
 }
 
@@ -1151,21 +1207,21 @@ async fn main() {
     let initial_capital = 500.0;
     let leverage = 10.0;
 
-    // IMPROVED: More aggressive parameters for better flow capture
-    let base_order_size = 15.0;  // Much larger orders
-    let base_spread_bps = 10.0;   // Tight base spread
-    let max_position = 100.0;    // Higher position limit
-    let update_threshold_pct = 0.001; // 0.1% - update more frequently
-    let status_interval = 5;      // Print status every 5 updates
+    // PROFITABLE CONFIGURATION - Conservative parameters
+    let base_order_size = 3.0;     // Reduced from 15.0
+    let base_spread_bps = 25.0;    // Increased from 10.0
+    let max_position = 30.0;       // Reduced from 100.0
+    let update_threshold_pct = 0.002; // Increased from 0.001
+    let status_interval = 5;
 
-    // Risk limits - balanced
+    // Risk limits
     let risk_limits = RiskLimits {
         max_position_size: max_position,
-        max_loss_per_day: 150.0,
-        max_drawdown_pct: 20.0,
+        max_loss_per_day: 100.0,    // Reduced from 150.0
+        max_drawdown_pct: 15.0,     // Reduced from 20.0
         startup_grace_period_ms: 120000,
-        max_margin_usage_pct: 85.0,
-        liquidation_buffer_pct: 10.0,
+        max_margin_usage_pct: 75.0, // Reduced from 85.0
+        liquidation_buffer_pct: 15.0, // Increased from 10.0
     };
 
     // Initialize client
@@ -1210,26 +1266,28 @@ async fn main() {
         .await
         .unwrap();
 
-    info!("🤖 AGGRESSIVE MARKET MAKER Started for {}", coin);
+    info!("🤖 PROFITABLE MARKET MAKER Started for {}", coin);
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     info!("💰 CAPITAL MANAGEMENT");
     info!("   Initial Capital: ${:.2}", initial_capital);
     info!("   Leverage: {}x", leverage);
     info!("   Max Buying Power: ${:.2}", initial_capital * leverage);
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    info!("🧠 AGGRESSIVE STRATEGY");
-    info!("   Base Order Size: {} HYPE (LARGE)", base_order_size);
-    info!("   Base Spread: {:.1} bps (TIGHT)", base_spread_bps);
-    info!("   Max Position: ±{} HYPE (HIGH)", max_position);
+    info!("🎯 PROFITABLE STRATEGY");
+    info!("   Base Order Size: {} HYPE (CONSERVATIVE)", base_order_size);
+    info!("   Base Spread: {:.1} bps (PROFITABLE)", base_spread_bps);
+    info!("   Min Spread: ~23 bps (Fee coverage + buffer)", );
+    info!("   Max Position: ±{} HYPE (MANAGED)", max_position);
     info!("   Maker Fee: {:.3}%", state.maker_fee_rate * 100.0);
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    info!("🎯 KEY IMPROVEMENTS");
-    info!("   ✓ MUCH tighter spreads (6 bps vs 30 bps)");
-    info!("   ✓ MUCH larger sizes (15 vs 1.0)");
-    info!("   ✓ Higher position limits (100 vs 30)");
-    info!("   ✓ Less restrictive order placement");
-    info!("   ✓ More frequent updates");
-    info!("   ✓ Better flow capture strategy");
+    info!("✨ KEY IMPROVEMENTS FOR PROFITABILITY");
+    info!("   ✓ Wider spreads (25 bps vs 10 bps)");
+    info!("   ✓ Smaller sizes (3 vs 15)");
+    info!("   ✓ Lower position limits (30 vs 100)");
+    info!("   ✓ Toxic flow detection and avoidance");
+    info!("   ✓ Minimum profitable spread enforcement");
+    info!("   ✓ Better inventory risk management");
+    info!("   ✓ Performance-based trading stops");
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     while let Some(message) = receiver.recv().await {
@@ -1243,6 +1301,18 @@ async fn main() {
 
                     state.update_bbo(bid_price, ask_price, bid_sz, ask_sz);
 
+                    // Check if we should stop trading based on performance
+                    if should_stop_trading(&state) {
+                        if trading_enabled {
+                            info!("🛑 STOPPING TRADING DUE TO PERFORMANCE LIMITS 🛑");
+                            cancel_simulated_orders(&mut state);
+                            trading_enabled = false;
+                            state.print_status();
+                        }
+                        continue;
+                    }
+
+                    // Check risk limits
                     let (is_safe, violations) = state.check_risk_limits(&risk_limits);
                     if !is_safe {
                         if trading_enabled {
