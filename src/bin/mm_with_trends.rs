@@ -1153,10 +1153,10 @@ async fn main() {
 
     // IMPROVED: More aggressive parameters for better flow capture
     let base_order_size = 15.0;  // Much larger orders
-    let base_spread_bps = 6.0;   // Tight base spread
+    let base_spread_bps = 10.0;   // Tight base spread
     let max_position = 100.0;    // Higher position limit
-    let update_threshold_pct = 0.0008; // 0.08% - update more frequently
-    let status_interval = 25;
+    let update_threshold_pct = 0.001; // 0.1% - update more frequently
+    let status_interval = 5;      // Print status every 5 updates
 
     // Risk limits - balanced
     let risk_limits = RiskLimits {
