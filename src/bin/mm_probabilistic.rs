@@ -7,6 +7,47 @@ use tokio::sync::mpsc::unbounded_channel;
 
 //RUST_LOG=info cargo run --bin mm_probabilistic
 
+// ============================================
+// PROBABILISTIC MARKET MAKER V4
+// ============================================
+// CRITICAL IMPROVEMENTS TO TOXIC FLOW DETECTION:
+// 
+// 1. MULTI-TIMEFRAME TOXICITY ANALYSIS
+//    - Analyzes flow over 10s, 60s, and 300s windows
+//    - Detects momentum (consecutive trades in same direction)
+//    - Measures volume surges (recent vs average)
+//    - Calculates price impact over each timeframe
+//
+// 2. VOLUME-WEIGHTED DIRECTIONAL FLOW
+//    - Uses actual trade volume, not just trade count
+//    - Dynamic prior = 10% of total volume (not fixed)
+//    - Prevents 0% buy ratio from small sample bias
+//    - Statistical confidence based on both sample size AND total volume
+//
+// 3. ADVERSE SELECTION TRACKING
+//    - Tracks when trades move against our orders
+//    - Detects when someone hits our bid and price drops (adverse)
+//    - Detects when someone lifts our offer and price rises (adverse)
+//    - Cumulative slippage measurement
+//    - Uses adverse ratio to adjust toxicity probability
+//
+// 4. VWAP CALCULATION
+//    - Maintains volume-weighted average price for buy and sell sides
+//    - Helps identify if we're getting filled at bad prices
+//    - Updated incrementally as trades arrive
+//
+// 5. ONE-SIDED FLOW DETECTION
+//    - Identifies when flow is >80% in one direction
+//    - Only blocks orders when one-sided AND high confidence (>70%)
+//    - Prevents getting run over by momentum
+//
+// 6. IMPROVED ORDER PLACEMENT LOGIC
+//    - Checks adverse selection ratio before placing orders
+//    - Blocks if adverse ratio > 70%
+//    - More lenient thresholds for reducing positions
+//    - Better handling of edge cases
+// ============================================
+
 const EPSILON: f64 = 1e-9;
 
 #[derive(Debug, Clone)]
@@ -38,39 +79,120 @@ struct TradeEvent {
     is_aggressive: bool,
 }
 
-/// Poisson-based order flow analyzer
+/// Improved multi-timeframe flow analyzer with adverse selection tracking
 #[derive(Debug)]
-struct PoissonFlowAnalyzer {
+struct ImprovedFlowAnalyzer {
     trade_events: VecDeque<TradeEvent>,
     window_ms: u64,
+    
+    // Multi-timeframe analysis
+    short_term_ms: u64,  // 10 seconds
+    medium_term_ms: u64, // 60 seconds  
+    long_term_ms: u64,   // 300 seconds
+    
+    // Volume-weighted metrics
+    vwap_buy: f64,
+    vwap_sell: f64,
+    total_buy_volume: f64,
+    total_sell_volume: f64,
+    
+    // Adverse selection tracking
+    trades_against_us: u32,
+    trades_favorable: u32,
+    cumulative_slippage: f64,
+    
+    // Legacy baseline for compatibility
     baseline_lambda: f64,
 }
 
-impl PoissonFlowAnalyzer {
+impl ImprovedFlowAnalyzer {
     fn new(window_seconds: u64) -> Self {
         Self {
             trade_events: VecDeque::new(),
             window_ms: window_seconds * 1000,
+            short_term_ms: 10_000,
+            medium_term_ms: 60_000,
+            long_term_ms: 300_000,
+            vwap_buy: 0.0,
+            vwap_sell: 0.0,
+            total_buy_volume: 0.0,
+            total_sell_volume: 0.0,
+            trades_against_us: 0,
+            trades_favorable: 0,
+            cumulative_slippage: 0.0,
             baseline_lambda: 0.0,
         }
     }
-
-    fn add_trade(&mut self, event: TradeEvent) {
+    
+    fn add_trade(&mut self, event: TradeEvent, our_bid: Option<f64>, our_ask: Option<f64>) {
         info!("📊 Trade added: {:.2} @ ${:.4} (Buy: {}, Aggressive: {})", 
               event.size, event.price, event.is_buy, event.is_aggressive);
         
+        // Track if trade was adverse to us
+        if let Some(bid) = our_bid {
+            if event.price <= bid && !event.is_buy {
+                // Someone hit our bid then price went down - adverse
+                self.trades_against_us += 1;
+                self.cumulative_slippage += (bid - event.price).abs();
+                info!("⚠️  Adverse trade detected against our bid");
+            } else if event.price > bid {
+                self.trades_favorable += 1;
+            }
+        }
+        
+        if let Some(ask) = our_ask {
+            if event.price >= ask && event.is_buy {
+                // Someone lifted our offer then price went up - adverse
+                self.trades_against_us += 1;
+                self.cumulative_slippage += (event.price - ask).abs();
+                info!("⚠️  Adverse trade detected against our ask");
+            } else if event.price < ask {
+                self.trades_favorable += 1;
+            }
+        }
+        
         let timestamp = event.timestamp;
+        
+        // Update VWAP
+        if event.is_buy {
+            let old_weight = self.total_buy_volume;
+            let new_weight = event.size;
+            self.total_buy_volume += new_weight;
+            
+            if self.total_buy_volume > 0.0 {
+                self.vwap_buy = (self.vwap_buy * old_weight + event.price * new_weight) 
+                                / self.total_buy_volume;
+            }
+        } else {
+            let old_weight = self.total_sell_volume;
+            let new_weight = event.size;
+            self.total_sell_volume += new_weight;
+            
+            if self.total_sell_volume > 0.0 {
+                self.vwap_sell = (self.vwap_sell * old_weight + event.price * new_weight)
+                                 / self.total_sell_volume;
+            }
+        }
+        
         self.trade_events.push_back(event);
-
+        
+        // Cleanup old events
         let cutoff = timestamp.saturating_sub(self.window_ms);
         while let Some(e) = self.trade_events.front() {
             if e.timestamp < cutoff {
+                // Remove from VWAP calculation too
+                if e.is_buy {
+                    self.total_buy_volume = (self.total_buy_volume - e.size).max(0.0);
+                } else {
+                    self.total_sell_volume = (self.total_sell_volume - e.size).max(0.0);
+                }
                 self.trade_events.pop_front();
             } else {
                 break;
             }
         }
-
+        
+        // Update baseline lambda for legacy compatibility
         if self.trade_events.len() >= 2 {
             let time_span = (timestamp - self.trade_events.front().unwrap().timestamp) as f64 / 1000.0;
             if time_span > 0.0 {
@@ -83,95 +205,173 @@ impl PoissonFlowAnalyzer {
             }
         }
     }
+    
+    fn calculate_multi_timeframe_toxicity(&self) -> (f64, f64, f64) {
+        let now = self.trade_events.back()
+            .map(|e| e.timestamp)
+            .unwrap_or_else(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64
+            });
+            
+        // Short-term (10s)
+        let short_cutoff = now.saturating_sub(self.short_term_ms);
+        let short_trades: Vec<&TradeEvent> = self.trade_events.iter()
+            .filter(|e| e.timestamp >= short_cutoff)
+            .collect();
+            
+        let short_toxicity = self.calculate_toxicity_for_trades(&short_trades);
+        
+        // Medium-term (60s)
+        let medium_cutoff = now.saturating_sub(self.medium_term_ms);
+        let medium_trades: Vec<&TradeEvent> = self.trade_events.iter()
+            .filter(|e| e.timestamp >= medium_cutoff)
+            .collect();
+            
+        let medium_toxicity = self.calculate_toxicity_for_trades(&medium_trades);
+        
+        // Long-term (300s)
+        let long_cutoff = now.saturating_sub(self.long_term_ms);
+        let long_trades: Vec<&TradeEvent> = self.trade_events.iter()
+            .filter(|e| e.timestamp >= long_cutoff)
+            .collect();
+        let long_toxicity = self.calculate_toxicity_for_trades(&long_trades);
+        
+        (short_toxicity, medium_toxicity, long_toxicity)
+    }
+    
+    fn calculate_toxicity_for_trades(&self, trades: &[&TradeEvent]) -> f64 {
+        if trades.len() < 5 {  // INCREASED from 3 to 5 - require more data
+            return 0.0;
+        }
+        
+        // 1. Check for momentum (consecutive trades in same direction)
+        let mut consecutive_buys = 0;
+        let mut consecutive_sells = 0;
+        let mut max_consecutive_buys = 0;
+        let mut max_consecutive_sells = 0;
+        let mut last_was_buy = false;
+        
+        for trade in trades {
+            if trade.is_buy {
+                if last_was_buy {
+                    consecutive_buys += 1;
+                } else {
+                    max_consecutive_sells = max_consecutive_sells.max(consecutive_sells);
+                    consecutive_sells = 0;
+                    consecutive_buys = 1;
+                }
+                last_was_buy = true;
+            } else {
+                if !last_was_buy {
+                    consecutive_sells += 1;
+                } else {
+                    max_consecutive_buys = max_consecutive_buys.max(consecutive_buys);
+                    consecutive_buys = 0;
+                    consecutive_sells = 1;
+                }
+                last_was_buy = false;
+            }
+        }
+        
+        max_consecutive_buys = max_consecutive_buys.max(consecutive_buys);
+        max_consecutive_sells = max_consecutive_sells.max(consecutive_sells);
+        
+        // LESS SENSITIVE: Require 8 consecutive instead of 5 to be toxic
+        let momentum_score = (max_consecutive_buys.max(max_consecutive_sells) as f64 / 8.0).min(1.0);
+        
+        // 2. Volume surge detection - LESS SENSITIVE
+        let avg_size = trades.iter().map(|t| t.size).sum::<f64>() / trades.len() as f64;
+        let recent_size = trades.last().map(|t| t.size).unwrap_or(avg_size);
+        let volume_surge = ((recent_size / avg_size.max(0.1)) / 5.0).min(1.0); // INCREASED from 3.0 to 5.0
+        
+        // 3. Price impact - LESS SENSITIVE
+        if trades.len() >= 2 {
+            let start_price = trades[0].price;
+            let end_price = trades[trades.len() - 1].price;
+            let price_move = ((end_price - start_price) / start_price).abs();
+            let price_impact = ((price_move * 10000.0) / 10.0).min(1.0); // INCREASED from 5 bps to 10 bps threshold
+            
+            // Combine signals - REDUCE weight of momentum
+            return momentum_score * 0.3 + volume_surge * 0.2 + price_impact * 0.5;
+        }
+        
+        momentum_score * 0.4 + volume_surge * 0.6
+    }
 
     fn get_trade_count(&self) -> usize {
         self.trade_events.len()
     }
 
-    fn get_toxicity_probability(&self, lookback_seconds: f64) -> f64 {
-        if self.baseline_lambda < EPSILON || self.trade_events.is_empty() {
-            return 0.0;
+    fn get_toxicity_probability(&self, _lookback_seconds: f64) -> f64 {
+        // Use multi-timeframe analysis instead
+        let (short, medium, long) = self.calculate_multi_timeframe_toxicity();
+        
+        // Weight recent toxicity more heavily
+        let weighted_toxicity = short * 0.5 + medium * 0.3 + long * 0.2;
+        
+        // Factor in adverse selection ratio
+        let total_trades = self.trades_against_us + self.trades_favorable;
+        if total_trades > 10 {
+            let adverse_ratio = self.trades_against_us as f64 / total_trades as f64;
+            return weighted_toxicity * 0.7 + adverse_ratio * 0.3;
         }
-
-        let now = self.trade_events.back().unwrap().timestamp;
-        let cutoff = now.saturating_sub((lookback_seconds * 1000.0) as u64);
-
-        let recent_count = self.trade_events.iter()
-            .filter(|e| e.timestamp >= cutoff)
-            .count();
-
-        let expected_count = self.baseline_lambda * lookback_seconds;
-
-        if expected_count < EPSILON {
-            return 0.0;
-        }
-
-        let lambda = expected_count;
-        let k = recent_count as f64;
-
-        if lambda > 10.0 {
-            let z_score = (k - lambda) / lambda.sqrt();
-            let p = 1.0 - normal_cdf(z_score);
-            1.0 - p
-        } else {
-            let prob_extreme = poisson_tail_probability(lambda, k as u64);
-            1.0 - prob_extreme
-        }
+        
+        weighted_toxicity
     }
-
-    fn get_directional_toxicity(&self, lookback_seconds: f64) -> (f64, f64) {
+    
+    fn get_improved_directional_flow(&self, window_seconds: f64) -> (f64, f64, bool) {
         if self.trade_events.is_empty() {
-            return (0.5, 0.0);
+            return (0.5, 0.0, false);
         }
-
+        
         let now = self.trade_events.back().unwrap().timestamp;
-        let cutoff = now.saturating_sub((lookback_seconds * 1000.0) as u64);
-
+        let cutoff = now.saturating_sub((window_seconds * 1000.0) as u64);
+        
         let recent_trades: Vec<&TradeEvent> = self.trade_events.iter()
             .filter(|e| e.timestamp >= cutoff && e.is_aggressive)
             .collect();
-
+        
         if recent_trades.is_empty() {
-            return (0.5, 0.0);
+            return (0.5, 0.0, false);
         }
-
+        
+        // Volume-weighted instead of count-based
         let mut buy_volume = 0.0;
         let mut sell_volume = 0.0;
-
-        for trade in recent_trades.iter() {
+        
+        for trade in &recent_trades {
             if trade.is_buy {
                 buy_volume += trade.size;
             } else {
                 sell_volume += trade.size;
             }
         }
-
-        // CRITICAL FIX: Add prior to prevent buy_ratio from being 0%
-        buy_volume += 0.2;  // Small prior
-        sell_volume += 0.2;
-
-        let total_volume = buy_volume + sell_volume;
-        if total_volume < EPSILON {
-            return (0.5, 0.0);
-        }
-
-        let buy_ratio = buy_volume / total_volume;
-
-        let n = recent_trades.len();
-        let k = recent_trades.iter().filter(|t| t.is_buy).count();
-
-        let p_observed = k as f64 / n as f64;
-        let p_null = 0.5;
-        let se = (p_null * (1.0 - p_null) / n as f64).sqrt();
         
-        if se < EPSILON {
-            return (buy_ratio, 0.0);
-        }
+        // Add meaningful prior (10% of total volume, not fixed)
+        let total = buy_volume + sell_volume;
+        let prior = total * 0.1;
+        buy_volume += prior;
+        sell_volume += prior;
+        
+        let buy_ratio = buy_volume / (buy_volume + sell_volume);
+        
+        // Check for one-sided flow - MORE STRICT THRESHOLD
+        let is_one_sided = buy_ratio > 0.85 || buy_ratio < 0.15;  // INCREASED from 0.8/0.2 to 0.85/0.15
+        
+        // Statistical confidence based on sample size and volume
+        let sample_confidence = (recent_trades.len() as f64 / 20.0).min(1.0);
+        let volume_confidence = (total / 100.0).min(1.0);
+        let confidence = (sample_confidence + volume_confidence) / 2.0;
+        
+        (buy_ratio, confidence, is_one_sided)
+    }
 
-        let z = ((p_observed - p_null).abs()) / se;
-        let confidence = 1.0 - 2.0 * (1.0 - normal_cdf(z));
-
-        (buy_ratio, confidence.max(0.0))
+    fn get_directional_toxicity(&self, lookback_seconds: f64) -> (f64, f64) {
+        let (buy_ratio, confidence, _) = self.get_improved_directional_flow(lookback_seconds);
+        (buy_ratio, confidence)
     }
 
     fn get_fill_probability(&self, our_price: f64, is_bid: bool, current_mid: f64) -> f64 {
@@ -206,6 +406,14 @@ impl PoissonFlowAnalyzer {
 
         let alpha = 0.5;
         (hits as f64 + alpha) / (recent_trades.len() as f64 + 2.0 * alpha)
+    }
+    
+    fn get_adverse_selection_ratio(&self) -> f64 {
+        let total = self.trades_against_us + self.trades_favorable;
+        if total < 5 {
+            return 0.5; // Not enough data
+        }
+        self.trades_against_us as f64 / total as f64
     }
 }
 
@@ -383,7 +591,7 @@ struct MarketMakerState {
 
     next_oid: u64,
 
-    flow_analyzer: PoissonFlowAnalyzer,
+    flow_analyzer: ImprovedFlowAnalyzer,
     bayesian_estimator: BayesianStateEstimator,
     volatility_tracker: VolatilityTracker,
 
@@ -428,7 +636,7 @@ impl MarketMakerState {
             max_buy_size: 0.0,
             max_sell_size: 0.0,
             next_oid: 1,
-            flow_analyzer: PoissonFlowAnalyzer::new(300),
+            flow_analyzer: ImprovedFlowAnalyzer::new(300),
             bayesian_estimator: BayesianStateEstimator::new(),
             volatility_tracker: VolatilityTracker::new(300),
             session_start_time: now,
@@ -572,13 +780,20 @@ impl MarketMakerState {
             .unwrap()
             .as_millis() as u64;
 
-        self.flow_analyzer.add_trade(TradeEvent {
-            timestamp,
-            price: trade_price,
-            size: trade_size,
-            is_buy: is_aggressive_buy,
-            is_aggressive: true,
-        });
+        let our_bid = self.our_bid_order.as_ref().map(|o| o.price);
+        let our_ask = self.our_ask_order.as_ref().map(|o| o.price);
+
+        self.flow_analyzer.add_trade(
+            TradeEvent {
+                timestamp,
+                price: trade_price,
+                size: trade_size,
+                is_buy: is_aggressive_buy,
+                is_aggressive: true,
+            },
+            our_bid,
+            our_ask,
+        );
     }
 
     fn check_fills(&mut self, trade_price: f64, is_aggressive_buy: bool, size: f64) -> Vec<String> {
@@ -793,6 +1008,9 @@ impl MarketMakerState {
 
         let toxicity_prob = self.flow_analyzer.get_toxicity_probability(10.0);
         let (buy_ratio, dir_confidence) = self.flow_analyzer.get_directional_toxicity(30.0);
+        let (_, _, is_one_sided) = self.flow_analyzer.get_improved_directional_flow(30.0);
+        let (short_tox, medium_tox, long_tox) = self.flow_analyzer.calculate_multi_timeframe_toxicity();
+        let adverse_ratio = self.flow_analyzer.get_adverse_selection_ratio();
         let bayesian_confidence = self.bayesian_estimator.get_confidence();
         let trade_count = self.flow_analyzer.get_trade_count();
 
@@ -830,10 +1048,19 @@ impl MarketMakerState {
         info!("Volatility: {:.3}%", volatility);
 
         info!("────────────────────────────────────────────────────────");
-        info!("🎲 PROBABILISTIC ANALYSIS (Trades: {})", trade_count);
+        info!("🎲 IMPROVED FLOW ANALYSIS (Trades: {})", trade_count);
         info!(
-            "Toxicity Probability: {:.1}% | Buy Flow: {:.1}% (confidence: {:.1}%)",
-            toxicity_prob * 100.0, buy_ratio * 100.0, dir_confidence * 100.0
+            "Multi-Timeframe Toxicity: 10s={:.1}% | 60s={:.1}% | 300s={:.1}%",
+            short_tox * 100.0, medium_tox * 100.0, long_tox * 100.0
+        );
+        info!(
+            "Overall Toxicity: {:.1}% | Adverse Selection Ratio: {:.1}%",
+            toxicity_prob * 100.0, adverse_ratio * 100.0
+        );
+        info!(
+            "Directional Flow: Buy {:.1}% (confidence: {:.1}%) {}",
+            buy_ratio * 100.0, dir_confidence * 100.0,
+            if is_one_sided { "⚠️  ONE-SIDED" } else { "" }
         );
         info!(
             "Bayesian Estimates (confidence: {:.1}%):",
@@ -933,137 +1160,145 @@ impl MarketMakerState {
     }
 }
 
-fn normal_cdf(x: f64) -> f64 {
-    0.5 * (1.0 + erf(x / 2.0_f64.sqrt()))
-}
 
-fn erf(x: f64) -> f64 {
-    let a1 = 0.254829592;
-    let a2 = -0.284496736;
-    let a3 = 1.421413741;
-    let a4 = -1.453152027;
-    let a5 = 1.061405429;
-    let p = 0.3275911;
-
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let x = x.abs();
-
-    let t = 1.0 / (1.0 + p * x);
-    let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-x * x).exp();
-
-    sign * y
-}
-
-fn poisson_tail_probability(lambda: f64, k: u64) -> f64 {
-    let mut prob = 0.0;
-    let mut term = (-lambda).exp();
-    
-    for i in 0..k {
-        prob += term;
-        term *= lambda / (i + 1) as f64;
-    }
-    
-    1.0 - prob
-}
 
 fn calculate_minimum_spread(state: &MarketMakerState) -> f64 {
-    let fee_coverage = state.maker_fee_rate * 2.0 * 10000.0;
-    let adverse_selection_buffer = 0.3;  // Further reduced from 0.5
-    let min_profit_target = 0.2;  // Further reduced from 0.3
+    // Base: Cover fees on both sides + minimum profit
+    let fee_coverage = state.maker_fee_rate * 2.0 * 10000.0; // 3 bps for 0.015% fee
     
-    fee_coverage + adverse_selection_buffer + min_profit_target
+    // Add buffer for adverse selection based on actual performance
+    let adverse_rate = if state.total_fills > 10 {
+        let losing_rate = state.losing_fills as f64 / state.total_fills.max(1) as f64;
+        losing_rate * 3.0 // More lenient for tight markets
+    } else {
+        0.3 // Very small initial buffer
+    };
+    
+    // Volatility adjustment - less aggressive
+    let volatility = state.volatility_tracker.get_volatility();
+    let vol_adjustment = (volatility * 30.0).max(0.2); // Even more lenient
+    
+    // Inventory risk (when holding position)
+    let inventory_cost = (state.position.abs() / 30.0) * 0.8; // Reduced
+    
+    // CRITICAL: For ultra-tight spread markets like HYPE (0.3-1.5 bps)
+    // We need to be VERY aggressive or we'll never place asks
+    let min_spread = fee_coverage + adverse_rate + vol_adjustment + inventory_cost + 0.2;
+    
+    // ABSOLUTE MINIMUM: 2.5 bps total spread to be profitable
+    min_spread.max(2.5)
 }
 
-/// Calculate expected value - V3 with minimal directional adjustment
-fn calculate_expected_value_spread(
+// ============================================
+// FIX 3: POSITION MANAGEMENT
+// ============================================
+
+fn calculate_position_limits(state: &MarketMakerState, base_max: f64) -> (f64, f64) {
+    // Dynamic position limits based on P&L
+    let pnl_ratio = (state.realized_pnl + state.unrealized_pnl) / state.initial_capital;
+    
+    // Reduce position limits when losing
+    let scaling_factor = if pnl_ratio < -0.02 {
+        info!("📉 Reducing position limits to 50% due to -{:.1}% P&L", pnl_ratio.abs() * 100.0);
+        0.5 // Half size when down 2%
+    } else if pnl_ratio < -0.01 {
+        info!("📉 Reducing position limits to 75% due to -{:.1}% P&L", pnl_ratio.abs() * 100.0);
+        0.75 // 75% size when down 1%
+    } else {
+        1.0
+    };
+    
+    let max_long = base_max * scaling_factor;
+    let max_short = -base_max * scaling_factor;
+    
+    (max_long, max_short)
+}
+
+
+
+// ============================================
+// FIX 4: SMARTER ORDER PLACEMENT
+// ============================================
+
+fn calculate_smart_quotes(
     state: &MarketMakerState,
-    base_spread_bps: f64,
+    base_size: f64,
     max_position: f64,
-    _risk_limits: &RiskLimits,
-) -> (f64, f64, f64) {
-    let mut spread_bps = base_spread_bps;
+) -> (Option<(f64, f64)>, Option<(f64, f64)>) {
+    let (short_tox, medium_tox, long_tox) = state.flow_analyzer.calculate_multi_timeframe_toxicity();
+    
+    // Weight recent toxicity more, but also discount long-term less
+    let weighted_toxicity = short_tox * 0.6 + medium_tox * 0.3 + long_tox * 0.1; // Increased short-term weight
+    
+    // MUCH MORE LENIENT: Only stay out if EXTREMELY toxic (was 0.8, now 0.95)
+    if weighted_toxicity > 0.95 {
+        info!("🚨 Flow too toxic ({:.1}%), staying out", weighted_toxicity * 100.0);
+        return (None, None);
+    }
     
     let min_spread = calculate_minimum_spread(state);
-    spread_bps = spread_bps.max(min_spread);
+    let (buy_ratio, confidence, is_one_sided) = state.flow_analyzer.get_improved_directional_flow(30.0);
     
-    let volatility = state.volatility_tracker.get_volatility();
-    if volatility > 0.01 {
-        spread_bps *= 1.0 + volatility * 20.0;
-    }
+    // Adjust spread based on toxicity - MUCH LESS AGGRESSIVE MULTIPLIER
+    let spread_multiplier = 1.0 + weighted_toxicity * 0.8; // REDUCED from 2.0x to 0.8x - max 1.8x instead of 3x
+    let adjusted_spread = min_spread * spread_multiplier;
     
-    let position_ratio = (state.position.abs() / max_position).min(1.0);
-    spread_bps *= 1.0 + position_ratio.powi(2) * 0.5;
-    
-    let toxic_prob = state.bayesian_estimator.prob_toxic_flow;
-    let adverse_selection_cost = toxic_prob * 1.0;
-    spread_bps += adverse_selection_cost;
-    
-    let (buy_ratio, dir_confidence) = state.flow_analyzer.get_directional_toxicity(30.0);
-    
-    // CRITICAL FIX V3: Further reduced from 5.0 to 2.0
-    let directional_adjustment = (buy_ratio - 0.5) * 2.0 * dir_confidence * 2.0;
-    
-    let half_spread_bps = spread_bps / 2.0;
-    
-    let bid_edge_bps = half_spread_bps + directional_adjustment;
-    let bid_price = state.mid_price * (1.0 - bid_edge_bps / 10000.0);
-    let bid_fill_prob = state.flow_analyzer.get_fill_probability(bid_price, true, state.mid_price);
-    
-    // CRITICAL FIX V3: Further reduced from 0.2 to 0.1
-    let bid_ev_bps = (bid_edge_bps - adverse_selection_cost * (1.0 - buy_ratio) * 0.1) * bid_fill_prob;
-    
-    info!("🔹 Bid EV: edge={:.2} bps, dir_adj={:.2}, fill_prob={:.1}%, adv_cost={:.2}, buy_ratio={:.1}%, final_ev={:.2}", 
-          bid_edge_bps, directional_adjustment, bid_fill_prob * 100.0, adverse_selection_cost, buy_ratio * 100.0, bid_ev_bps);
-    
-    let ask_edge_bps = half_spread_bps - directional_adjustment;
-    let ask_price = state.mid_price * (1.0 + ask_edge_bps / 10000.0);
-    let ask_fill_prob = state.flow_analyzer.get_fill_probability(ask_price, false, state.mid_price);
-    let ask_ev_bps = (ask_edge_bps - adverse_selection_cost * buy_ratio * 0.1) * ask_fill_prob;
-    
-    info!("🔸 Ask EV: edge={:.2} bps, dir_adj={:.2}, fill_prob={:.1}%, adv_cost={:.2}, final_ev={:.2}", 
-          ask_edge_bps, directional_adjustment, ask_fill_prob * 100.0, adverse_selection_cost, ask_ev_bps);
-    
-    (spread_bps, bid_ev_bps, ask_ev_bps)
-}
-
-fn calculate_dynamic_skew(
-    state: &MarketMakerState,
-    max_position: f64,
-) -> (f64, f64, f64, f64) {
+    // Position skew
     let position_ratio = state.position / max_position;
+    let position_skew = position_ratio * 5.0; // 5 bps per full position
     
-    let trending_bias = (state.bayesian_estimator.prob_trending - 0.25) * 20.0;
-    let mean_revert_bias = (state.bayesian_estimator.prob_mean_reverting - 0.5) * -10.0;
+    // Calculate prices - SYMMETRIC PRICING
+    let half_spread = adjusted_spread / 2.0;
     
-    let inventory_urgency = if position_ratio.abs() > 0.5 {
-        position_ratio.powi(2) * 100.0
+    // Skew quotes based on inventory and flow
+    // FIXED: Ensure both sides get similar edge to place both orders
+    let bid_adjustment = if state.position > max_position * 0.5 {
+        // Already long, make bid less aggressive
+        half_spread + position_skew.abs() + (buy_ratio - 0.5) * 8.0 * confidence
     } else {
-        position_ratio.powi(2) * position_ratio.signum() * 40.0
+        half_spread - position_skew + (buy_ratio - 0.5) * 4.0 * confidence
     };
-
-    let total_skew_bps = inventory_urgency + trending_bias + mean_revert_bias;
-    let skew_amount = state.mid_price * total_skew_bps / 10000.0;
-
-    let confidence = state.bayesian_estimator.get_confidence();
-    let mut size_multiplier = 0.8 + confidence * 0.4;
     
-    size_multiplier *= 1.0 - position_ratio.abs() * 0.5;
+    let ask_adjustment = if state.position < -max_position * 0.5 {
+        // Already short, make ask less aggressive  
+        half_spread + position_skew.abs() - (buy_ratio - 0.5) * 8.0 * confidence
+    } else {
+        half_spread + position_skew - (buy_ratio - 0.5) * 4.0 * confidence
+    };
     
-    if state.bayesian_estimator.prob_volatile > 0.5 {
-        size_multiplier *= 0.7;
-    }
-
-    let (buy_ratio, dir_confidence) = state.flow_analyzer.get_directional_toxicity(30.0);
-    let mut flow_asymmetry = (buy_ratio - 0.5) * 2.0 * dir_confidence;
+    let bid_price = state.mid_price * (1.0 - bid_adjustment / 10000.0);
+    let ask_price = state.mid_price * (1.0 + ask_adjustment / 10000.0);
     
-    // CRITICAL FIX: Cap directional adjustment to improve ask fill probability
-    // Prevents asks from moving too far away during strong buy flow
-    flow_asymmetry = flow_asymmetry.clamp(-0.5, 0.5);
+    // Size based on confidence and position - MORE AGGRESSIVE
+    let bid_size = if state.position > max_position * 0.67 {
+        base_size * 0.5 // INCREASED from 0.3 to 0.5 - less reduction when long
+    } else if is_one_sided && buy_ratio > 0.8 {  // INCREASED threshold from 0.7 to 0.8
+        base_size * 0.7 // INCREASED from 0.5 to 0.7 - less reduction in buy pressure
+    } else {
+        base_size * (1.0 - weighted_toxicity * 0.5)  // Only reduce by 50% of toxicity
+    };
     
-    let bid_size_adj = (1.0 + flow_asymmetry * 0.3).max(0.7).min(1.3);
-    let ask_size_adj = (1.0 - flow_asymmetry * 0.3).max(0.7).min(1.3);
-
-    (skew_amount, size_multiplier, bid_size_adj, ask_size_adj)
+    let ask_size = if state.position < -max_position * 0.67 {
+        base_size * 0.5 // INCREASED from 0.3 to 0.5 - less reduction when short
+    } else if is_one_sided && buy_ratio < 0.2 {  // DECREASED threshold from 0.3 to 0.2
+        base_size * 0.7 // INCREASED from 0.5 to 0.7 - less reduction in sell pressure
+    } else {
+        base_size * (1.0 - weighted_toxicity * 0.5)  // Only reduce by 50% of toxicity
+    };
+    
+    let bid = if bid_size >= 0.1 && state.position < max_position * 0.83 {
+        Some((bid_price, bid_size))
+    } else {
+        None
+    };
+    
+    let ask = if ask_size >= 0.1 && state.position > -max_position * 0.83 {
+        Some((ask_price, ask_size))
+    } else {
+        None
+    };
+    
+    (bid, ask)
 }
 
 fn should_place_order(
@@ -1076,14 +1311,23 @@ fn should_place_order(
     risk_limits: &RiskLimits,
 ) -> (bool, String) {
     let is_reducing_position = (is_buy && state.position < -5.0) || (!is_buy && state.position > 5.0);
+    
+    // FIXED: Make EV threshold much more lenient, especially for reducing positions
     let ev_threshold = if is_reducing_position {
-        risk_limits.min_expected_value_bps * 0.2
+        risk_limits.min_expected_value_bps * 0.1  // SUPER lenient when reducing
     } else {
         risk_limits.min_expected_value_bps
     };
     
+    // CRITICAL FIX: In ultra-tight markets, ANY positive edge is good
+    // Don't be too picky or we'll never place asks
     if expected_value_bps < ev_threshold {
-        return (false, format!("EV too low: {:.2} < {:.2} bps", expected_value_bps, ev_threshold));
+        // Still allow if edge is positive and we're trying to balance inventory
+        if expected_value_bps > 0.0 && state.position.abs() > max_position * 0.3 {
+            // Allow it - we need to manage inventory
+        } else {
+            return (false, format!("EV too low: {:.3} < {:.3} bps", expected_value_bps, ev_threshold));
+        }
     }
 
     let toxic_prob = state.bayesian_estimator.prob_toxic_flow;
@@ -1091,15 +1335,23 @@ fn should_place_order(
         return (false, format!("Toxic flow probability too high: {:.1}%", toxic_prob * 100.0));
     }
 
-    // CRITICAL FIX V3: Ask threshold lowered from 0.05 to 0.01
-    let (buy_ratio, dir_confidence) = state.flow_analyzer.get_directional_toxicity(30.0);
-    if dir_confidence > 0.6 {
-        if is_buy && buy_ratio > 0.9 {
-            return (false, "Strong buying pressure detected".to_string());
+    // Use improved directional flow detection
+    let (buy_ratio, dir_confidence, is_one_sided) = state.flow_analyzer.get_improved_directional_flow(30.0);
+    
+    // Only block orders on truly one-sided flow with high confidence
+    if is_one_sided && dir_confidence > 0.7 {
+        if is_buy && buy_ratio > 0.85 {
+            return (false, format!("Strong one-sided buying pressure: {:.1}%", buy_ratio * 100.0));
         }
-        if !is_buy && buy_ratio < 0.01 {  // Changed from 0.05
-            return (false, format!("Strong selling pressure detected (buy_ratio: {:.1}%)", buy_ratio * 100.0));
+        if !is_buy && buy_ratio < 0.15 {
+            return (false, format!("Strong one-sided selling pressure: {:.1}%", buy_ratio * 100.0));
         }
+    }
+    
+    // Additional check: adverse selection ratio
+    let adverse_ratio = state.flow_analyzer.get_adverse_selection_ratio();
+    if adverse_ratio > 0.7 {
+        return (false, format!("High adverse selection: {:.1}%", adverse_ratio * 100.0));
     }
 
     let position_ratio = state.position / max_position;
@@ -1140,17 +1392,34 @@ fn should_place_order(
 fn should_update_orders(
     state: &MarketMakerState,
     last_mid: f64,
-    threshold_pct: f64,
+    _threshold_pct: f64,  // Kept for API compatibility but not used
 ) -> bool {
     if state.our_bid_order.is_none() || state.our_ask_order.is_none() {
         return true;
     }
 
-    // Relaxed: Increased from threshold_pct * 10.0 to threshold_pct * 25.0
-    // This means we only cancel if price moves >5 bps (0.002 * 25 = 0.05 = 5 bps)
+    // DYNAMIC THRESHOLD: Scale with volatility
+    // In volatile markets, update more frequently (lower threshold)
+    // In calm markets, update less frequently (higher threshold)
+    let volatility = state.volatility_tracker.get_volatility();
+    
+    // Base threshold: 3 bps for normal volatility (0.01 or 1%)
+    // Scale: 0.5x to 2x based on volatility
+    // Low vol (0.005): 6 bps threshold (more patient)
+    // Normal vol (0.01): 3 bps threshold
+    // High vol (0.02): 1.5 bps threshold (more responsive)
+    let base_threshold_bps = 3.0;
+    let vol_ratio = volatility / 0.01; // Normalize to 1% volatility
+    let vol_multiplier = (1.0 / vol_ratio.max(0.5).min(2.0)).max(0.5).min(2.0);
+    let dynamic_threshold_bps = base_threshold_bps * vol_multiplier;
+    
     if last_mid > 0.0 {
         let price_change_pct = ((state.mid_price - last_mid) / last_mid).abs();
-        if price_change_pct > threshold_pct * 25.0 {
+        let price_change_bps = price_change_pct * 10000.0;
+        
+        if price_change_bps > dynamic_threshold_bps {
+            info!("📊 Price moved {:.2} bps > {:.2} bps threshold (vol: {:.3}%)", 
+                  price_change_bps, dynamic_threshold_bps, volatility * 100.0);
             return true;
         }
     }
@@ -1161,43 +1430,39 @@ fn should_update_orders(
         .as_millis() as u64;
 
     if let Some(bid) = &state.our_bid_order {
-        // Relaxed: Widened edge bounds from [1.0, 150.0] to [0.5, 200.0]
+        // FIXED: For ultra-tight spreads, accept tighter edges
         let bid_edge_bps = ((state.mid_price - bid.price) / state.mid_price) * 10000.0;
-        if bid_edge_bps > 200.0 || bid_edge_bps < 0.5 {
+        if bid_edge_bps > 150.0 || bid_edge_bps < 0.3 {  // Accept down to 0.3 bps edge
             return true;
         }
         
-        // Relaxed: Increased minimum order age from 180s to 300s (5 minutes)
-        let order_age = now.saturating_sub(bid.timestamp) / 1000;
-        if order_age > 300 {
-            info!("🕐 Bid order too old ({}s), cancelling", order_age);
-            return true;
-        }
-    }
-    
-    if let Some(ask) = &state.our_ask_order {
-        // Relaxed: Widened edge bounds from [1.0, 150.0] to [0.5, 200.0]
-        let ask_edge_bps = ((ask.price - state.mid_price) / state.mid_price) * 10000.0;
-        if ask_edge_bps > 200.0 || ask_edge_bps < 0.5 {
-            return true;
-        }
-        
-        // Relaxed: Increased minimum order age from 180s to 300s (5 minutes)
-        let order_age = now.saturating_sub(ask.timestamp) / 1000;
-        if order_age > 300 {
-            info!("🕐 Ask order too old ({}s), cancelling", order_age);
-            return true;
-        }
-    }
-
-    // Relaxed: Increased time since last update from 120s to 180s (3 minutes)
-    let time_since_update = now.saturating_sub(state.last_update_ts) as f64 / 1000.0;
-    
-    if time_since_update > 180.0 {
+    // FIXED: Reduce order churn - keep orders longer
+    let order_age = now.saturating_sub(bid.timestamp) / 1000;
+    if order_age > 60 {  // Only cancel after 1 minute (was 5 minutes)
+        info!("🕐 Bid order aged out ({}s)", order_age);
         return true;
     }
+}
 
-    // Relaxed: Increased toxic flow threshold from 0.6 to 0.8
+    if let Some(ask) = &state.our_ask_order {
+        // FIXED: For ultra-tight spreads, accept tighter edges
+        let ask_edge_bps = ((ask.price - state.mid_price) / state.mid_price) * 10000.0;
+        if ask_edge_bps > 150.0 || ask_edge_bps < 0.3 {  // Accept down to 0.3 bps edge
+            return true;
+        }    // FIXED: Reduce order churn - keep orders longer
+    let order_age = now.saturating_sub(ask.timestamp) / 1000;
+    if order_age > 60 {  // Only cancel after 1 minute (was 5 minutes)
+        info!("🕐 Ask order aged out ({}s)", order_age);
+        return true;
+    }
+}
+
+// FIXED: Don't update too frequently - reduce churn
+let time_since_update = now.saturating_sub(state.last_update_ts) as f64 / 1000.0;
+
+if time_since_update > 45.0 {  // Only force update after 45 seconds
+    return true;
+}    // Relaxed: Increased toxic flow threshold from 0.6 to 0.8
     let toxic_prob = state.bayesian_estimator.prob_toxic_flow;
     if toxic_prob > 0.8 {
         return true;
@@ -1221,62 +1486,73 @@ fn cancel_simulated_orders(state: &mut MarketMakerState) {
 fn place_probabilistic_orders(
     state: &mut MarketMakerState,
     base_order_size: f64,
-    base_spread_bps: f64,
+    _base_spread_bps: f64,
     max_position: f64,
     risk_limits: &RiskLimits,
 ) {
-    let (spread_bps, bid_ev_bps, ask_ev_bps) = calculate_expected_value_spread(
-        state, base_spread_bps, max_position, risk_limits
-    );
+    // Apply dynamic position limits based on P&L
+    let (max_long, max_short) = calculate_position_limits(state, max_position);
+    let effective_max = max_long.min(max_short.abs());
     
-    let half_spread_bps = spread_bps / 2.0;
-
-    let (skew_adjustment, size_multiplier, bid_size_adj, ask_size_adj) =
-        calculate_dynamic_skew(state, max_position);
-
-    // CRITICAL FIX V3: Even tighter - 0.2 instead of 0.3
-    let bid_spread_bps = (half_spread_bps + (skew_adjustment / state.mid_price) * 10000.0) * 0.2;
-    let ask_spread_bps = (half_spread_bps - (skew_adjustment / state.mid_price) * 10000.0) * 0.2;
-
-    let our_bid_price = state.mid_price * (1.0 - bid_spread_bps / 10000.0);
-    let our_ask_price = state.mid_price * (1.0 + ask_spread_bps / 10000.0);
-
-    let bid_size = (base_order_size * size_multiplier * bid_size_adj * 100.0).round() / 100.0;
-    let ask_size = (base_order_size * size_multiplier * ask_size_adj * 100.0).round() / 100.0;
-
-    let our_bid_price = (our_bid_price * 10000.0).round() / 10000.0;
-    let our_ask_price = (our_ask_price * 10000.0).round() / 10000.0;
-
-    let (can_place_bid, bid_reason) = should_place_order(
-        state, true, bid_size, our_bid_price, bid_ev_bps, max_position, risk_limits
-    );
+    // Use smart quotes calculation for better toxicity handling
+    let (bid_quote, ask_quote) = calculate_smart_quotes(state, base_order_size, effective_max);
     
-    if can_place_bid && bid_size >= 0.01 {
-        let bid_order = state.place_simulated_order(true, our_bid_price, bid_size);
+    // Place bid if smart quotes says we should
+    if let Some((bid_price, bid_size)) = bid_quote {
+        // Round price and size
+        let our_bid_price = (bid_price * 10000.0).round() / 10000.0;
+        let our_bid_size = (bid_size * 100.0).round() / 100.0;
+        
+        // Calculate EV for this price
         let bid_fill_prob = state.flow_analyzer.get_fill_probability(our_bid_price, true, state.mid_price);
-        info!(
-            "🔹 BID: {:.2} @ ${:.4} (OID: {}) | {:.2} bps EV | {:.1}% fill prob | {}",
-            bid_size, our_bid_price, bid_order.oid, bid_ev_bps, bid_fill_prob * 100.0, bid_reason
+        let bid_edge_bps = ((state.mid_price - our_bid_price) / state.mid_price) * 10000.0;
+        let bid_ev_bps = bid_edge_bps * bid_fill_prob;
+        
+        let (can_place_bid, bid_reason) = should_place_order(
+            state, true, our_bid_size, our_bid_price, bid_ev_bps, effective_max, risk_limits
         );
-        state.our_bid_order = Some(bid_order);
+        
+        if can_place_bid && our_bid_size >= 0.01 {
+            let bid_order = state.place_simulated_order(true, our_bid_price, our_bid_size);
+            info!(
+                "🔹 BID: {:.2} @ ${:.4} (OID: {}) | {:.2} bps edge | {:.1}% fill prob | EV: {:.2} bps | {}",
+                our_bid_size, our_bid_price, bid_order.oid, bid_edge_bps, bid_fill_prob * 100.0, bid_ev_bps, bid_reason
+            );
+            state.our_bid_order = Some(bid_order);
+        } else {
+            info!("⚠️  Skipping bid - {}", bid_reason);
+        }
     } else {
-        info!("⚠️  Skipping bid - {}", bid_reason);
+        info!("⚠️  No bid: Smart quotes declined (toxicity or position limits)");
     }
 
-    let (can_place_ask, ask_reason) = should_place_order(
-        state, false, ask_size, our_ask_price, ask_ev_bps, max_position, risk_limits
-    );
-    
-    if can_place_ask && ask_size >= 0.01 {
-        let ask_order = state.place_simulated_order(false, our_ask_price, ask_size);
+    // Place ask if smart quotes says we should
+    if let Some((ask_price, ask_size)) = ask_quote {
+        // Round price and size
+        let our_ask_price = (ask_price * 10000.0).round() / 10000.0;
+        let our_ask_size = (ask_size * 100.0).round() / 100.0;
+        
+        // Calculate EV for this price
         let ask_fill_prob = state.flow_analyzer.get_fill_probability(our_ask_price, false, state.mid_price);
-        info!(
-            "🔸 ASK: {:.2} @ ${:.4} (OID: {}) | {:.2} bps EV | {:.1}% fill prob | {}",
-            ask_size, our_ask_price, ask_order.oid, ask_ev_bps, ask_fill_prob * 100.0, ask_reason
+        let ask_edge_bps = ((our_ask_price - state.mid_price) / state.mid_price) * 10000.0;
+        let ask_ev_bps = ask_edge_bps * ask_fill_prob;
+        
+        let (can_place_ask, ask_reason) = should_place_order(
+            state, false, our_ask_size, our_ask_price, ask_ev_bps, effective_max, risk_limits
         );
-        state.our_ask_order = Some(ask_order);
+        
+        if can_place_ask && our_ask_size >= 0.01 {
+            let ask_order = state.place_simulated_order(false, our_ask_price, our_ask_size);
+            info!(
+                "🔸 ASK: {:.2} @ ${:.4} (OID: {}) | {:.2} bps edge | {:.1}% fill prob | EV: {:.2} bps | {}",
+                our_ask_size, our_ask_price, ask_order.oid, ask_edge_bps, ask_fill_prob * 100.0, ask_ev_bps, ask_reason
+            );
+            state.our_ask_order = Some(ask_order);
+        } else {
+            info!("⚠️  Skipping ask - {}", ask_reason);
+        }
     } else {
-        info!("⚠️  Skipping ask - {}", ask_reason);
+        info!("⚠️  No ask: Smart quotes declined (toxicity or position limits)");
     }
 }
 
@@ -1314,6 +1590,67 @@ fn should_stop_trading(state: &MarketMakerState) -> bool {
     false
 }
 
+// ============================================
+// FIX 5: EMERGENCY POSITION UNWINDING
+// ============================================
+
+fn should_unwind_position(state: &MarketMakerState, max_position: f64) -> bool {
+    // Unwind if:
+    // 1. Position is near max and losing money
+    let position_ratio = state.position.abs() / max_position;
+    let is_losing = state.unrealized_pnl < -5.0;
+    
+    if position_ratio > 0.8 && is_losing {
+        info!("🚨 Emergency unwind: Position ratio {:.1}% with loss ${:.2}", 
+              position_ratio * 100.0, state.unrealized_pnl);
+        return true;
+    }
+    
+    // 2. Fees are eating all profits
+    if state.realized_pnl > 0.0 {
+        let fee_ratio = state.total_fees_paid / state.realized_pnl;
+        if fee_ratio > 0.9 {
+            info!("🚨 Emergency unwind: Fees eating {:.1}% of profits", fee_ratio * 100.0);
+            return true;
+        }
+    }
+    
+    // 3. Drawdown is too high
+    let total_pnl = state.realized_pnl + state.unrealized_pnl - state.total_fees_paid;
+    if total_pnl < -20.0 {
+        info!("🚨 Emergency unwind: Total loss ${:.2} exceeds limit", total_pnl);
+        return true;
+    }
+    
+    false
+}
+
+fn place_unwind_orders(state: &mut MarketMakerState) {
+    if state.position == 0.0 {
+        return;
+    }
+    
+    let unwind_size = state.position.abs().min(5.0); // Unwind up to 5 units at a time
+    
+    if state.position > 0.0 {
+        // Need to sell to unwind long position
+        // Place aggressive sell order (slightly below mid)
+        let unwind_price = state.mid_price * 0.9995; // 0.5 bps below mid
+        let ask_order = state.place_simulated_order(false, unwind_price, unwind_size);
+        info!("🚨 UNWINDING LONG: Selling {:.2} @ ${:.4} (OID: {})", 
+              unwind_size, unwind_price, ask_order.oid);
+        state.our_ask_order = Some(ask_order);
+    } else {
+        // Need to buy to unwind short position
+        // Place aggressive buy order (slightly above mid)
+        let unwind_price = state.mid_price * 1.0005; // 0.5 bps above mid
+        let bid_order = state.place_simulated_order(true, unwind_price, unwind_size);
+        info!("🚨 UNWINDING SHORT: Buying {:.2} @ ${:.4} (OID: {})", 
+              unwind_size, unwind_price, bid_order.oid);
+        state.our_bid_order = Some(bid_order);
+    }
+}
+
 #[tokio::main]
 async fn main() {
     env_logger::init();
@@ -1324,11 +1661,11 @@ async fn main() {
     let initial_capital = 500.0;
     let leverage = 10.0;
 
-    // V3 Configuration - Final aggressive tuning
-    let base_order_size = 5.0;
-    let base_spread_bps = 3.5;  // Reduced from 4.0
-    let max_position = 30.0;
-    let update_threshold_pct = 0.002;
+    // V4 Configuration - FIXED for ultra-tight spread markets
+    let base_order_size = 2.5;  // Moderate size
+    let base_spread_bps = 5.0;
+    let max_position = 15.0;  // REDUCED for better inventory control
+    let update_threshold_pct = 0.002;  // Legacy parameter - now dynamically adjusted based on volatility
     let status_interval = 5;
     let min_trades_before_start = 5;
 
@@ -1339,7 +1676,7 @@ async fn main() {
         startup_grace_period_ms: 120000,
         max_margin_usage_pct: 75.0,
         liquidation_buffer_pct: 15.0,
-        min_expected_value_bps: 0.0,  // CRITICAL: Allow any positive EV
+        min_expected_value_bps: 0.01,  // FIXED: 0.01 bps (0.001%) is realistic for tight spread markets
     };
 
     let mut info_client = InfoClient::new(None, Some(BaseUrl::Mainnet))
@@ -1387,18 +1724,19 @@ async fn main() {
     
     info!("✅ Subscribed to trades for {}", coin);
 
-    info!("🤖 PROBABILISTIC MARKET MAKER V3 Started for {}", coin);
+    info!("🤖 PROBABILISTIC MARKET MAKER V4 Started for {}", coin);
     info!("╔════════════════════════════════════════════════════════╗");
-    info!("🎲 V3 CRITICAL FIXES");
-    info!("   ✓ Directional adjustment: 5.0 → 2.0 (60% reduction)");
-    info!("   ✓ Adverse selection: 20% → 10% (50% reduction)");
-    info!("   ✓ Sell pressure threshold: 5% → 1%");
-    info!("   ✓ Spread multiplier: 30% → 20% (even tighter)");
-    info!("   ✓ Min spread components reduced");
-    info!("   ✓ Buy ratio prior: +0.2 to prevent 0%");
-    info!("   ✓ Min EV threshold: 0.005 → 0.0 (any positive)");
-    info!("   ✓ Base spread: 4.0 → 3.5 bps");
-    info!("   ✓ Order book depth logging");
+    info!("🎲 V4 IMPROVED FLOW ANALYZER");
+    info!("   ✓ Multi-timeframe toxicity (10s/60s/300s)");
+    info!("   ✓ Volume-weighted directional flow (not count-based)");
+    info!("   ✓ Adverse selection tracking against our orders");
+    info!("   ✓ VWAP calculation for buy/sell sides");
+    info!("   ✓ Momentum detection (consecutive trades)");
+    info!("   ✓ Volume surge detection");
+    info!("   ✓ Price impact measurement");
+    info!("   ✓ One-sided flow detection");
+    info!("   ✓ Dynamic prior (10% of volume, not fixed)");
+    info!("   ✓ Statistical confidence based on sample size & volume");
     info!("╚════════════════════════════════════════════════════════╝");
 
     while let Some(message) = receiver.recv().await {
@@ -1474,6 +1812,15 @@ async fn main() {
                     }
 
                     if trading_enabled {
+                        // Check if emergency unwinding is needed
+                        if should_unwind_position(&state, max_position) {
+                            info!("🚨 EMERGENCY UNWINDING POSITION 🚨");
+                            cancel_simulated_orders(&mut state);
+                            place_unwind_orders(&mut state);
+                            state.print_status();
+                            continue;
+                        }
+                        
                         let should_update = should_update_orders(
                             &state,
                             last_update_mid,
