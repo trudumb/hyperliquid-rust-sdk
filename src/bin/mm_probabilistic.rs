@@ -125,8 +125,8 @@ impl ImprovedFlowAnalyzer {
     }
     
     fn add_trade(&mut self, event: TradeEvent, our_bid: Option<f64>, our_ask: Option<f64>) {
-        info!("📊 Trade added: {:.2} @ ${:.4} (Buy: {}, Aggressive: {})", 
-              event.size, event.price, event.is_buy, event.is_aggressive);
+        //info!("📊 Trade added: {:.2} @ ${:.4} (Buy: {}, Aggressive: {})", 
+              //event.size, event.price, event.is_buy, event.is_aggressive);
         
         // Track if trade was adverse to us
         if let Some(bid) = our_bid {
@@ -654,8 +654,8 @@ impl MarketMakerState {
         self.ask_depth = ask_sz;
 
         // Log order book depth
-        info!("📈 Order Book: Bid ${:.4} ({:.1}) / Ask ${:.4} ({:.1}) | Spread: {:.2} bps", 
-              bid, bid_sz, ask, ask_sz, (self.spread / self.mid_price) * 10000.0);
+        //info!("📈 Order Book: Bid ${:.4} ({:.1}) / Ask ${:.4} ({:.1}) | Spread: {:.2} bps", 
+              //bid, bid_sz, ask, ask_sz, (self.spread / self.mid_price) * 10000.0);
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1664,7 +1664,7 @@ async fn main() {
     // V4 Configuration - FIXED for ultra-tight spread markets
     let base_order_size = 2.5;  // Moderate size
     let base_spread_bps = 5.0;
-    let max_position = 15.0;  // REDUCED for better inventory control
+    let max_position = 50.0;
     let update_threshold_pct = 0.002;  // Legacy parameter - now dynamically adjusted based on volatility
     let status_interval = 5;
     let min_trades_before_start = 5;
