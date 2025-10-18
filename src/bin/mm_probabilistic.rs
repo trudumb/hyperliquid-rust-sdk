@@ -1054,7 +1054,11 @@ fn calculate_dynamic_skew(
     }
 
     let (buy_ratio, dir_confidence) = state.flow_analyzer.get_directional_toxicity(30.0);
-    let flow_asymmetry = (buy_ratio - 0.5) * 2.0 * dir_confidence;
+    let mut flow_asymmetry = (buy_ratio - 0.5) * 2.0 * dir_confidence;
+    
+    // CRITICAL FIX: Cap directional adjustment to improve ask fill probability
+    // Prevents asks from moving too far away during strong buy flow
+    flow_asymmetry = flow_asymmetry.clamp(-0.5, 0.5);
     
     let bid_size_adj = (1.0 + flow_asymmetry * 0.3).max(0.7).min(1.3);
     let ask_size_adj = (1.0 - flow_asymmetry * 0.3).max(0.7).min(1.3);
@@ -1142,9 +1146,11 @@ fn should_update_orders(
         return true;
     }
 
+    // Relaxed: Increased from threshold_pct * 10.0 to threshold_pct * 25.0
+    // This means we only cancel if price moves >5 bps (0.002 * 25 = 0.05 = 5 bps)
     if last_mid > 0.0 {
         let price_change_pct = ((state.mid_price - last_mid) / last_mid).abs();
-        if price_change_pct > threshold_pct * 10.0 {
+        if price_change_pct > threshold_pct * 25.0 {
             return true;
         }
     }
@@ -1155,39 +1161,45 @@ fn should_update_orders(
         .as_millis() as u64;
 
     if let Some(bid) = &state.our_bid_order {
+        // Relaxed: Widened edge bounds from [1.0, 150.0] to [0.5, 200.0]
         let bid_edge_bps = ((state.mid_price - bid.price) / state.mid_price) * 10000.0;
-        if bid_edge_bps > 150.0 || bid_edge_bps < 1.0 {
+        if bid_edge_bps > 200.0 || bid_edge_bps < 0.5 {
             return true;
         }
         
+        // Relaxed: Increased minimum order age from 180s to 300s (5 minutes)
         let order_age = now.saturating_sub(bid.timestamp) / 1000;
-        if order_age > 180 {
+        if order_age > 300 {
             info!("🕐 Bid order too old ({}s), cancelling", order_age);
             return true;
         }
     }
     
     if let Some(ask) = &state.our_ask_order {
+        // Relaxed: Widened edge bounds from [1.0, 150.0] to [0.5, 200.0]
         let ask_edge_bps = ((ask.price - state.mid_price) / state.mid_price) * 10000.0;
-        if ask_edge_bps > 150.0 || ask_edge_bps < 1.0 {
+        if ask_edge_bps > 200.0 || ask_edge_bps < 0.5 {
             return true;
         }
         
+        // Relaxed: Increased minimum order age from 180s to 300s (5 minutes)
         let order_age = now.saturating_sub(ask.timestamp) / 1000;
-        if order_age > 180 {
+        if order_age > 300 {
             info!("🕐 Ask order too old ({}s), cancelling", order_age);
             return true;
         }
     }
 
+    // Relaxed: Increased time since last update from 120s to 180s (3 minutes)
     let time_since_update = now.saturating_sub(state.last_update_ts) as f64 / 1000.0;
     
-    if time_since_update > 120.0 {
+    if time_since_update > 180.0 {
         return true;
     }
 
+    // Relaxed: Increased toxic flow threshold from 0.6 to 0.8
     let toxic_prob = state.bayesian_estimator.prob_toxic_flow;
-    if toxic_prob > 0.6 {
+    if toxic_prob > 0.8 {
         return true;
     }
 
